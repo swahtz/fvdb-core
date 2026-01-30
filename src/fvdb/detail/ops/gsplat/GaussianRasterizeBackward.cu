@@ -662,6 +662,17 @@ struct RasterizeBackwardArgs {
         const uint32_t numBatches =
             (lastGaussianIdInBlock - firstGaussianIdInBlock + blockSize - 1) / blockSize;
 
+        // Compute the maximum lastGaussianId across the entire block for early exit optimization.
+        // This allows us to skip batches that no thread in the block needs and exit early
+        // when all useful work is done.
+        __shared__ int32_t maxLastGaussianIdInBlock;
+        if (tidx == 0) {
+            maxLastGaussianIdInBlock = -1;
+        }
+        __syncthreads();
+        atomicMax(&maxLastGaussianIdInBlock, lastGaussianId);
+        __syncthreads();
+
         constexpr size_t NUM_CHUNKS =
             (NUM_CHANNELS + NUM_SHARED_CHANNELS - 1) / NUM_SHARED_CHANNELS;
         for (size_t chunk = 0; chunk < NUM_CHUNKS; chunk += 1) {
@@ -700,8 +711,25 @@ struct RasterizeBackwardArgs {
                 // blockSize (i.e. one Gaussian per thread in the block), and batchEnd is the
                 // index of the last gaussian. NOTE: These values can be negative so must be
                 // int32 instead of uint32
-                const int32_t batchEnd = lastGaussianIdInBlock - 1 - blockSize * b;
-                const int32_t idx      = batchEnd - tidx;
+                const int32_t batchEnd   = lastGaussianIdInBlock - 1 - blockSize * b;
+                const int32_t batchStart = batchEnd - blockSize + 1;
+
+                // Early exit optimization: if the entire batch is beyond what any thread
+                // in the block needs (all Gaussians in this batch have index >
+                // maxLastGaussianIdInBlock), skip this batch. Since we process back-to-front, later
+                // batches will have smaller indices and may still be needed.
+                if (batchStart > maxLastGaussianIdInBlock) {
+                    continue;
+                }
+
+                // Early termination: if even the highest index in this batch is below the
+                // first Gaussian in the tile, all remaining batches will also be outside
+                // the valid range, so we can exit the loop entirely.
+                if (batchEnd < firstGaussianIdInBlock) {
+                    break;
+                }
+
+                const int32_t idx = batchEnd - tidx;
                 if (idx >= firstGaussianIdInBlock) {
                     const int32_t g =
                         commonArgs.mTileGaussianIds[idx]; // Gaussian index in [C * N] or [nnz]
