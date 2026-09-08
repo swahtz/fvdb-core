@@ -1090,6 +1090,14 @@ class GridBatch:
             * Only the **sign** of ``field`` is trusted; magnitudes are rebuilt. With ``smooth=0``
               the input's zero crossing is preserved (to sub-voxel accuracy); smoothing moves the
               surface to its de-staircased position and then re-redistances.
+            * The surface is where the field changes sign between *active* voxels; one active voxel
+              of each sign across the crossing is sufficient (two or more per side gives the best
+              sub-voxel accuracy). A grid whose active values are all one sign has no surface: the
+              result is the constant ``-/+band*vx`` and :meth:`rebuild_narrow_band` returns an empty
+              band for that grid, which is correct for e.g. a tile that lies entirely inside an
+              object. An occupancy mask must therefore be given a positive exterior layer first
+              (``dilated_grid(1)`` + ``inject_from`` with a positive default) -- its boundary is not
+              treated as a surface.
             * Inactive neighbours read as ``+/-band*vx`` with the sign of the adjacent active voxel,
               so both filled solids (interior active) and narrow bands whose interior is inactive are
               valid inputs. Voxels with no data are best left *inactive* rather than given a value.

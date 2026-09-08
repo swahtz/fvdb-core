@@ -216,6 +216,32 @@ class ReinitializeSdfTests(unittest.TestCase):
             self.assertTrue(torch.equal(gb_out[i].ijk.jdata, g_flat.ijk))
             self.assertTrue(torch.allclose(phib[i].jdata, phi_flat, atol=1e-5))
 
+    def test_single_sign_field_has_no_surface(self):
+        """The surface is a sign change between ACTIVE voxels. An all-negative field (a raw occupancy
+        mask) has none: reinitialize_sdf returns the constant -band*vx and rebuild_narrow_band an empty
+        band. The active-region boundary is deliberately NOT a surface -- a tile lying entirely inside
+        an object must come back empty. Adding one positive exterior layer restores the surface."""
+        solid = fvdb.Grid.from_ijk(self.grid.ijk[self.analytic < 0], voxel_size=self.vx, origin=0.0)
+        occupancy = -torch.ones(solid.num_voxels, device=self.device)
+        phi = solid.reinitialize_sdf(occupancy, band=self.band)
+        self.assertTrue(torch.allclose(phi, torch.full_like(phi, -self.bw)))
+        empty, phi_empty = solid.rebuild_narrow_band(occupancy, band=self.band)
+        self.assertEqual(empty.num_voxels, 0)
+        self.assertEqual(phi_empty.shape[0], 0)
+
+        # occupancy recipe: one exterior layer seeded positive -> the boundary becomes the surface
+        shell = solid.dilated_grid(1)
+        signed = shell.inject_from(solid, occupancy, default_value=1.0)
+        g, sdf = shell.rebuild_narrow_band(signed, band=self.band)
+        self.assertGreater(g.num_voxels, 0)
+        self.assertGreater((sdf > 0).sum().item(), 0)
+        self.assertGreater((sdf < 0).sum().item(), 0)
+        # boundary sits ~half a voxel outside the outermost occupied voxel centre; a +/-1 step on a
+        # voxelised boundary carries staircase error, so only check it lands within a voxel
+        analytic = (g.ijk.float() * self.vx).norm(dim=1) - (self.R + 0.5 * self.vx)
+        near = analytic.abs() < 1.5 * self.vx
+        self.assertLess((sdf[near] - analytic[near]).abs().mean().item(), 1.0 * self.vx)
+
     def test_anisotropic_voxels_rejected(self):
         """The eikonal solve uses a single voxel size, so anisotropic grids must raise, not
         silently return distances scaled along y/z."""
