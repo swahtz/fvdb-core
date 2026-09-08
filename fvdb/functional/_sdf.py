@@ -231,6 +231,10 @@ def rebuild_narrow_band_batch(
     """
     # per-grid narrow-band half-width; voxel size may vary across the batch
     band_width = band * grid.voxel_sizes[:, 0]
+    # Canonicalize scalar fields to flat per-voxel storage: reinitialize_sdf accepts (N, 1) (and
+    # returns (N,)), and the padding masks below must be one-dimensional.
+    if field.jdata.dim() != 1:
+        field = field.jagged_like(field.jdata.reshape(-1))
     if pad:
         grid, field = _pad_with_sign_batch(grid, field, band, band_width)
     phi = reinitialize_sdf_batch(grid, field, band, smooth, order, smoothing, redistance_iters)
@@ -289,6 +293,10 @@ def rebuild_narrow_band_single(
     """
     # narrow-band half-width
     band_width = band * float(grid.voxel_size[0])
+    # Canonicalize scalar fields to flat per-voxel storage: reinitialize_sdf accepts (N, 1) (and
+    # returns (N,)), and the padding masks below must be one-dimensional.
+    if field.dim() != 1:
+        field = field.reshape(-1)
     if pad:
         grid, field = _pad_with_sign_single(grid, field, band, band_width)
     phi = reinitialize_sdf_single(grid, field, band, smooth, order, smoothing, redistance_iters)

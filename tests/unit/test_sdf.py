@@ -196,6 +196,26 @@ class ReinitializeSdfTests(unittest.TestCase):
             self.assertTrue(torch.equal(gb2[i].ijk.jdata, g2.ijk))
             self.assertTrue(torch.allclose(phib[i].jdata, phi, atol=1e-5))
 
+    def test_rebuild_accepts_column_field(self):
+        """(N, 1) scalar fields (the usual TSDF layout) must work with the default pad=True, single and
+        batched, and match the flat (N,) result."""
+        field = self.analytic.clamp(-self.bw, self.bw)
+        g_flat, phi_flat = self.grid.rebuild_narrow_band(field, band=self.band)
+        g_col, phi_col = self.grid.rebuild_narrow_band(field[:, None], band=self.band)
+        self.assertEqual(phi_col.dim(), 1)
+        self.assertTrue(torch.equal(g_col.ijk, g_flat.ijk))
+        self.assertTrue(torch.allclose(phi_col, phi_flat))
+
+        gb = fvdb.GridBatch.from_ijk(
+            fvdb.JaggedTensor([self.grid.ijk, self.grid.ijk]), voxel_sizes=self.vx, origins=0.0
+        )
+        fb_col = gb.jagged_like(torch.cat([field, field])[:, None])
+        gb_out, phib = gb.rebuild_narrow_band(fb_col, band=self.band)
+        self.assertEqual(phib.jdata.dim(), 1)
+        for i in range(2):
+            self.assertTrue(torch.equal(gb_out[i].ijk.jdata, g_flat.ijk))
+            self.assertTrue(torch.allclose(phib[i].jdata, phi_flat, atol=1e-5))
+
     def test_anisotropic_voxels_rejected(self):
         """The eikonal solve uses a single voxel size, so anisotropic grids must raise, not
         silently return distances scaled along y/z."""
