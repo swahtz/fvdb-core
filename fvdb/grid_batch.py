@@ -1095,7 +1095,7 @@ class GridBatch:
               sub-voxel accuracy). A grid whose active values are all one sign has no surface: the
               result is the constant ``-/+band*vx`` and :meth:`rebuild_narrow_band` returns an empty
               band for that grid, which is correct for e.g. a tile that lies entirely inside an
-              object. The boundary of the active region is not itself a surface.
+              object.
             * Inactive neighbours read as ``+/-band*vx`` with the sign of the adjacent active voxel,
               so both filled solids (interior active) and narrow bands whose interior is inactive are
               valid inputs. Voxels with no data are best left *inactive* rather than given a value.

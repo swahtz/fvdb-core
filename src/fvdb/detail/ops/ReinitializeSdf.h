@@ -36,8 +36,8 @@ enum class SmoothingMode : int32_t {
 ///                    (no-data pass-through), though its signed neighbours see it as an interface.
 ///                    The surface is where the field changes sign between ACTIVE voxels; a grid
 ///                    whose active values are all one sign has no surface and comes back as the
-///                    constant -/+band*vx (the active-region boundary is not a surface).
-///                    Voxels must be isotropic (a ValueError is raised otherwise).
+///                    constant -/+band*vx. Voxels must be isotropic (a ValueError is raised
+///                    otherwise).
 /// @param band        Narrow-band half-width in voxels. The field is clamped to [-band*vx, band*vx]
 ///                    each sweep. Inactive neighbours act as a Dirichlet boundary whose value
 ///                    continues the sign of the adjacent active voxel: -band*vx beside a negative
