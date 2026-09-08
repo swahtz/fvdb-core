@@ -121,9 +121,8 @@ def reinitialize_sdf_batch(
           each sign across the crossing is sufficient (two or more per side gives the best sub-voxel
           accuracy). A grid whose active values are all one sign has no surface: the result is the
           constant ``-/+band*vx`` and :func:`rebuild_narrow_band_batch` returns an empty band, which
-          is correct for e.g. a tile that lies entirely inside an object. An occupancy mask must
-          therefore be given a positive exterior layer first (``dilated_grid(1)`` + ``inject`` with
-          ``default_value=+1``) -- its boundary is not treated as a surface.
+          is correct for e.g. a tile that lies entirely inside an object. The boundary of the active
+          region is not itself a surface.
         * Inactive neighbours read as ``+/-band*vx`` with the sign of the adjacent active voxel, so
           both filled solids (interior active) and narrow bands whose interior is inactive are valid
           inputs. Voxels with no data are best left *inactive* rather than given a value.
