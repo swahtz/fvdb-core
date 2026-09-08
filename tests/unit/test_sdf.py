@@ -128,6 +128,74 @@ class ReinitializeSdfTests(unittest.TestCase):
         v, f, n = g1.marching_cubes(phi1, level=0.0)
         self.assertGreater(v.shape[0], 0)
 
+    # ------------------------------------------------------------------ inactive interior
+    def _narrow_band_grid(self):
+        """The sphere restricted to |phi| < band*vx: a narrow band whose INTERIOR is inactive."""
+        keep = self.analytic.abs() < self.bw
+        g = fvdb.Grid.from_ijk(self.grid.ijk[keep], voxel_size=self.vx, origin=0.0)
+        analytic = (g.ijk.float() * self.vx).norm(dim=1) - self.R
+        return g, analytic
+
+    def test_reinitialize_narrow_band_with_inactive_interior(self):
+        """A narrow band with an inactive interior must stay solid: the inner half of the band must
+        match the analytic SDF as closely as the outer half, not grow a phantom inner surface.
+
+        An IndexGrid has a single background slot, so inactive neighbours are resolved per read with
+        the sign of the adjacent voxel (-band*vx inside, +band*vx outside). Before that fix the inner
+        half-band error was ~3.6 vx and the innermost voxels flipped positive."""
+        g, analytic = self._narrow_band_grid()
+        field = analytic.clamp(-self.bw, self.bw)
+        phi = g.reinitialize_sdf(field, band=self.band, order=3)
+        err = (phi - analytic).abs()
+        inner = (analytic <= -0.5 * self.bw) & (analytic > -self.bw)
+        outer = (analytic >= 0.5 * self.bw) & (analytic < self.bw)
+        self.assertLess(err[inner].mean().item(), 0.25 * self.vx)
+        self.assertLess(err[inner].max().item(), 1.0 * self.vx)
+        # inner and outer halves should be comparably accurate
+        self.assertLess(err[inner].mean().item(), 3.0 * err[outer].mean().item() + 0.05 * self.vx)
+        # no sign flips away from the surface
+        away = analytic.abs() > 0.5 * self.vx
+        self.assertEqual(((phi.sign() != analytic.sign()) & away).sum().item(), 0)
+        # the deepest interior voxels still reach the band clamp
+        self.assertLess(phi.min().item(), -(self.band - 1.25) * self.vx)
+
+    def test_retopologize_idempotent(self):
+        """retopologize_sdf applied to its own (interior-pruned) output must reproduce that output."""
+        field = self.analytic.clamp(-self.bw, self.bw)
+        g1, phi1 = self.grid.retopologize_sdf(field, band=self.band)
+        for pad in (False, True):
+            g2, phi2 = g1.retopologize_sdf(phi1, band=self.band, pad=pad)
+            a2 = (g2.ijk.float() * self.vx).norm(dim=1) - self.R
+            err = (phi2 - a2).abs()
+            self.assertLess(err.mean().item(), 0.25 * self.vx, f"pad={pad}")
+            self.assertLess(phi2.min().item(), -(self.band - 1.25) * self.vx, f"pad={pad}")
+            # same band on both passes (within a layer of voxels)
+            self.assertLess(abs(g2.num_voxels - g1.num_voxels) / g1.num_voxels, 0.1, f"pad={pad}")
+
+    def test_pad_seeds_interior_of_hollow_band(self):
+        """Padding a narrow band with an inactive interior must seed the inward layers negative."""
+        g, analytic = self._narrow_band_grid()
+        field = analytic.clamp(-self.bw, self.bw)
+        padded, phi = g.retopologize_sdf(field, band=self.band, pad=True, prune=False)
+        a = (padded.ijk.float() * self.vx).norm(dim=1) - self.R
+        interior_new = a < -self.bw  # voxels the padding added on the inside
+        self.assertGreater(interior_new.sum().item(), 0)
+        self.assertTrue((phi[interior_new] < 0).all().item())
+        exterior_new = a > self.bw
+        self.assertTrue((phi[exterior_new] > 0).all().item())
+
+    def test_batch_pad_matches_single(self):
+        """Batched sign-aware padding must agree with the single-grid path for each grid."""
+        g, analytic = self._narrow_band_grid()
+        field = analytic.clamp(-self.bw, self.bw)
+        gb = fvdb.GridBatch.from_ijk(fvdb.JaggedTensor([g.ijk, g.ijk]), voxel_sizes=self.vx, origins=0.0)
+        fb = gb.jagged_like(torch.cat([field, field]))
+        gb2, phib = gb.retopologize_sdf(fb, band=self.band, pad=True)
+        g2, phi = g.retopologize_sdf(field, band=self.band, pad=True)
+        for i in range(2):
+            self.assertTrue(torch.equal(gb2[i].ijk.jdata, g2.ijk))
+            self.assertTrue(torch.allclose(phib[i].jdata, phi, atol=1e-5))
+
     # ------------------------------------------------------------------ batch
     def test_batch_matches_single(self):
         vx = self.vx

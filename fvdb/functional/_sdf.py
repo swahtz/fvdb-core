@@ -24,6 +24,61 @@ def _to_cpp_smoothing(smoothing: SmoothingMode) -> "_fvdb_cpp.SmoothingMode":
 
 
 # ---------------------------------------------------------------------------
+#  sign-aware padding (shared by retopologize_sdf_{single,batch})
+# ---------------------------------------------------------------------------
+
+
+def _seed_sign(neighbor_values_sum: torch.Tensor, band_width: torch.Tensor | float) -> torch.Tensor:
+    """``-band_width`` where the summed neighbour values are negative, else ``+band_width``."""
+    return torch.where(neighbor_values_sum < 0, -band_width, band_width)
+
+
+def _pad_with_sign_single(grid: Grid, field: torch.Tensor, band: int, band_width: float) -> tuple[Grid, torch.Tensor]:
+    """Dilate ``grid`` by ``band`` voxels, one layer at a time, seeding each fresh voxel with
+    ``+/-band_width`` according to the sign of its already-present 26-neighbours.
+
+    An IndexGrid cannot mark inactive space as interior or exterior, so a constant exterior seed
+    would turn the inside of a hollow narrow band into "outside". Growing one layer at a time and
+    copying the sign of the neighbours lets the padding continue the field inward and outward.
+    """
+    for _ in range(band):
+        dilated = grid.dilated_grid(1)
+        padded = inject_single(dilated, grid, field, default_value=float("nan"))
+        is_new = torch.isnan(padded)
+        if is_new.any():
+            nbr = grid.neighbor_indexes(dilated.ijk[is_new], 1).reshape(int(is_new.sum()), -1)
+            zero = torch.zeros((), dtype=field.dtype, device=field.device)
+            nbr_sum = torch.where(nbr >= 0, field[nbr.clamp(min=0)], zero).sum(dim=1)
+            padded[is_new] = _seed_sign(nbr_sum, band_width).to(field.dtype)
+        grid, field = dilated, padded
+    return grid, field
+
+
+def _pad_with_sign_batch(
+    grid: GridBatch, field: JaggedTensor, band: int, band_width: torch.Tensor
+) -> tuple[GridBatch, JaggedTensor]:
+    """Batched :func:`_pad_with_sign_single`; ``band_width`` holds one half-width per grid."""
+    for _ in range(band):
+        dilated = grid.dilated_grid(1)
+        padded = inject_batch(dilated, grid, field, default_value=float("nan"))
+        is_new = torch.isnan(padded.jdata)
+        if is_new.any():
+            new_ijk = dilated.ijk.rmask(is_new)
+            # neighbor_indexes returns per-grid indices; shift them into the flat jdata.
+            nbr = grid.neighbor_indexes(new_ijk, 1).jdata.reshape(int(is_new.sum()), -1)
+            grid_of_new = new_ijk.jidx.long()
+            flat = nbr + field.joffsets[grid_of_new, None].to(nbr.device)
+            zero = torch.zeros((), dtype=field.jdata.dtype, device=field.jdata.device)
+            nbr_sum = torch.where(nbr >= 0, field.jdata[flat.clamp(min=0)], zero).sum(dim=1)
+            bw = band_width.to(field.jdata.device, field.jdata.dtype)[grid_of_new]
+            data = padded.jdata.clone()
+            data[is_new] = _seed_sign(nbr_sum, bw)
+            padded = padded.jagged_like(data)
+        grid, field = dilated, padded
+    return grid, field
+
+
+# ---------------------------------------------------------------------------
 #  reinitialize_sdf  (fixed-topology redistance + de-staircase)
 # ---------------------------------------------------------------------------
 
@@ -136,11 +191,10 @@ def retopologize_sdf_batch(
         redistance_iters (int): Number of redistancing sweeps. ``<= 0`` uses the default.
         pad (bool): If ``True`` (default) dilate the grid by ``band`` voxels before redistancing so
             the output narrow band is a full ``band`` voxels wide even if the input grid had a
-            thinner active region. Newly added voxels are seeded as *exterior* (``+band*vx``), which
-            is correct when the dilation extends outward -- i.e. when the grid's interior (the
-            ``phi < 0`` region) is already represented (the usual case for occupancy/TSDF/mesh-derived
-            fields). For a thin shell that does not fill its interior, pass ``pad=False`` and supply a
-            grid that already has an adequate band.
+            thinner active region. The dilation grows one layer at a time and seeds each new voxel
+            with ``+/-band*vx`` according to the sign of its existing neighbours, so padding
+            continues a narrow band both outward (exterior) and inward (interior) and works for
+            filled solids as well as narrow bands whose interior is inactive.
         prune (bool): If ``True`` prune to the narrow band; if ``False`` return the (possibly
             padded) grid and the re-initialized field unchanged.
 
@@ -153,11 +207,7 @@ def retopologize_sdf_batch(
     # per-grid narrow-band half-width; voxel size may vary across the batch
     band_width = band * grid.voxel_sizes[:, 0]
     if pad:
-        # Seed fresh voxels as exterior. A positive seed >= every grid's band width is fine:
-        # reinitialize_sdf re-clamps it to that grid's +band*vx, so only its (positive) sign matters.
-        dilated = grid.dilated_grid(band)
-        field = inject_batch(dilated, grid, field, default_value=float(band_width.max()))
-        grid = dilated
+        grid, field = _pad_with_sign_batch(grid, field, band, band_width)
     phi = reinitialize_sdf_batch(grid, field, band, smooth, order, smoothing, redistance_iters)
     if not prune:
         return grid, phi
@@ -195,11 +245,10 @@ def retopologize_sdf_single(
         redistance_iters (int): Number of redistancing sweeps. ``<= 0`` uses the default.
         pad (bool): If ``True`` (default) dilate the grid by ``band`` voxels before redistancing so
             the output narrow band is a full ``band`` voxels wide even if the input grid had a
-            thinner active region. Newly added voxels are seeded as *exterior* (``+band*vx``), which
-            is correct when the dilation extends outward -- i.e. when the grid's interior (the
-            ``phi < 0`` region) is already represented (the usual case for occupancy/TSDF/mesh-derived
-            fields). For a thin shell that does not fill its interior, pass ``pad=False`` and supply a
-            grid that already has an adequate band.
+            thinner active region. The dilation grows one layer at a time and seeds each new voxel
+            with ``+/-band*vx`` according to the sign of its existing neighbours, so padding
+            continues a narrow band both outward (exterior) and inward (interior) and works for
+            filled solids as well as narrow bands whose interior is inactive.
         prune (bool): If ``True`` prune to the narrow band; if ``False`` return the (possibly padded)
             grid and the re-initialized field unchanged.
 
@@ -212,11 +261,7 @@ def retopologize_sdf_single(
     # narrow-band half-width
     band_width = band * float(grid.voxel_size[0])
     if pad:
-        # Seed fresh voxels as exterior. A positive seed >= the grid's band width is fine:
-        # reinitialize_sdf re-clamps it to +band*vx, so only its (positive) sign matters.
-        dilated = grid.dilated_grid(band)
-        field = inject_single(dilated, grid, field, default_value=band_width)
-        grid = dilated
+        grid, field = _pad_with_sign_single(grid, field, band, band_width)
     phi = reinitialize_sdf_single(grid, field, band, smooth, order, smoothing, redistance_iters)
     if not prune:
         return grid, phi

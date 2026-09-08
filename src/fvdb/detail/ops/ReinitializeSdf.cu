@@ -34,7 +34,8 @@ static constexpr int kLog2BlockWidth = 9;
 // neighbours through a cached ReadAccessor. Yields `centerIndex` (the centre voxel's value index)
 // and `faceIndex[6]` (the 6 face-neighbour value indices, -x,+x,-y,+y,-z,+z; 0 =
 // inactive/background). Kernels using it take the grid/firstLeafID/jumpMap/firstOffset parameters
-// by these exact names.
+// by these exact names. Neighbour VALUES must be read through `faceValue` (below), never
+// `field[faceIndex[k]]` directly, so that inactive neighbours get a sign-aware boundary value.
 #define VBM_FACES_BEGIN()                                                                        \
     constexpr int blockWidth = 1 << kLog2BlockWidth, jumpMapWordCount = blockWidth / 64;         \
     using VoxelBlockManagerT = nanovdb::tools::cuda::VoxelBlockManager<kLog2BlockWidth>;         \
@@ -60,6 +61,27 @@ static constexpr int kLog2BlockWidth = 9;
                                         accessor.getValue(centerCoord.offsetBy(0, 0, -1)),       \
                                         accessor.getValue(centerCoord.offsetBy(0, 0, 1))};
 
+// Sign-aware read of a face neighbour. An IndexGrid has a single background slot (value index 0),
+// so it cannot carry OpenVDB's two-signed inactive tiles (-background inside, +background outside).
+// Instead, an inactive neighbour continues the sign of the centre voxel: beside a negative voxel it
+// is deep interior (-bandWidth), beside a positive voxel deep exterior (+bandWidth). Without this
+// the inner edge of a narrow band sees +bandWidth across the face and a phantom interface forms
+// one voxel inside the true surface. Active neighbours are read from the value-indexed buffer.
+template <typename ScalarT>
+__device__ inline ScalarT
+faceValue(const ScalarT *field, uint64_t index, ScalarT center, ScalarT bandWidth) {
+    return index ? field[index] : (center < ScalarT(0) ? -bandWidth : bandWidth);
+}
+
+// Reads the 6 face neighbours of `field` around `centerValue` into xm,xp,ym,yp,zm,zp.
+#define VBM_FACE_VALUES(field, centerValue, bandWidth)                                  \
+    const ScalarT xm = faceValue<ScalarT>(field, faceIndex[0], centerValue, bandWidth), \
+                  xp = faceValue<ScalarT>(field, faceIndex[1], centerValue, bandWidth), \
+                  ym = faceValue<ScalarT>(field, faceIndex[2], centerValue, bandWidth), \
+                  yp = faceValue<ScalarT>(field, faceIndex[3], centerValue, bandWidth), \
+                  zm = faceValue<ScalarT>(field, faceIndex[4], centerValue, bandWidth), \
+                  zp = faceValue<ScalarT>(field, faceIndex[5], centerValue, bandWidth)
+
 // =====================  fused stencil kernels ====================================================
 // frozen Peng smoothed sign from a field's value + central-difference gradient.
 template <typename ScalarT>
@@ -70,12 +92,13 @@ signFusedKernel(const OnIndexGridT *grid,
                 uint64_t firstOffset,
                 const ScalarT *field,
                 ScalarT voxelSize,
+                ScalarT bandWidth,
                 ScalarT *sign) {
     VBM_FACES_BEGIN();
-    ScalarT xm = field[faceIndex[0]], xp = field[faceIndex[1]], ym = field[faceIndex[2]],
-            yp = field[faceIndex[3]], zm = field[faceIndex[4]], zp = field[faceIndex[5]];
+    const ScalarT phiCenter = field[centerIndex];
+    VBM_FACE_VALUES(field, phiCenter, bandWidth);
     ScalarT gradX = (xp - xm) / (2 * voxelSize), gradY = (yp - ym) / (2 * voxelSize),
-            gradZ = (zp - zm) / (2 * voxelSize), phiCenter = field[centerIndex];
+            gradZ = (zp - zm) / (2 * voxelSize);
     sign[centerIndex] =
         phiCenter / nanovdb::math::Sqrt(phiCenter * phiCenter +
                                         (gradX * gradX + gradY * gradY + gradZ * gradZ) *
@@ -108,11 +131,11 @@ godunovFusedKernel(const OnIndexGridT *grid,
                    const ScalarT *field,
                    const ScalarT *sign,
                    ScalarT voxelSize,
+                   ScalarT bandWidth,
                    ScalarT *rhs) {
     VBM_FACES_BEGIN();
-    ScalarT center = field[centerIndex], sgn = sign[centerIndex];
-    ScalarT xm = field[faceIndex[0]], xp = field[faceIndex[1]], ym = field[faceIndex[2]],
-            yp = field[faceIndex[3]], zm = field[faceIndex[4]], zp = field[faceIndex[5]];
+    const ScalarT center = field[centerIndex], sgn = sign[centerIndex];
+    VBM_FACE_VALUES(field, center, bandWidth);
     ScalarT gradMag = nanovdb::math::Sqrt(
         upwind<ScalarT>((center - xm) / voxelSize, (xp - center) / voxelSize, sgn) +
         upwind<ScalarT>((center - ym) / voxelSize, (yp - center) / voxelSize, sgn) +
@@ -130,12 +153,12 @@ smoothFusedKernel(const OnIndexGridT *grid,
                   uint64_t firstOffset,
                   const ScalarT *in,
                   ScalarT weight,
+                  ScalarT bandWidth,
                   ScalarT *out) {
     VBM_FACES_BEGIN();
-    ScalarT center   = in[centerIndex];
-    ScalarT faceMean = (in[faceIndex[0]] + in[faceIndex[1]] + in[faceIndex[2]] + in[faceIndex[3]] +
-                        in[faceIndex[4]] + in[faceIndex[5]]) *
-                       (ScalarT(1) / ScalarT(6));
+    const ScalarT center = in[centerIndex];
+    VBM_FACE_VALUES(in, center, bandWidth);
+    ScalarT faceMean = (xm + xp + ym + yp + zm + zp) * (ScalarT(1) / ScalarT(6));
     out[centerIndex] = center + weight * (faceMean - center);
 }
 
@@ -212,9 +235,10 @@ struct VBMHelper {
 };
 
 // Redistance (|grad phi| = 1) + optional de-staircase one grid's value-indexed buffer, in place.
-// `phi`/scratch are length `valueCount` with slot 0 holding the +bandWidth background; the
-// stencil/combiner kernels never write slot 0 (so inactive-neighbour reads always see the boundary
-// value).
+// `phi`/scratch are length `valueCount`; slot 0 is the (never written) background slot. Stencil
+// kernels do not read slot 0: inactive neighbours are resolved by `faceValue` to
+// +/-bandWidth with the sign of the centre voxel, so a narrow band with an inactive interior is
+// treated as continuing inward, not as exterior.
 template <typename ScalarT>
 void
 runReinit(OnIndexGridT *grid,
@@ -244,14 +268,14 @@ runReinit(OnIndexGridT *grid,
     auto godunov = [&](const ScalarT *field, ScalarT *out) {
         if (blockCount) {
             godunovFusedKernel<ScalarT><<<blockCount, blockWidth, 0, stream>>>(
-                grid, firstLeafID, jumpMap, firstOffset, field, sign, voxelSize, out);
+                grid, firstLeafID, jumpMap, firstOffset, field, sign, voxelSize, bandWidth, out);
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
     };
     auto redistance = [&](int iters) {
         if (blockCount) {
             signFusedKernel<ScalarT><<<blockCount, blockWidth, 0, stream>>>(
-                grid, firstLeafID, jumpMap, firstOffset, phi, voxelSize, sign);
+                grid, firstLeafID, jumpMap, firstOffset, phi, voxelSize, bandWidth, sign);
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
         for (int it = 0; it < iters; ++it) {
@@ -320,7 +344,7 @@ runReinit(OnIndexGridT *grid,
         auto pass = [&](ScalarT weight) {
             if (blockCount) {
                 smoothFusedKernel<ScalarT><<<blockCount, blockWidth, 0, stream>>>(
-                    grid, firstLeafID, jumpMap, firstOffset, cur, weight, other);
+                    grid, firstLeafID, jumpMap, firstOffset, cur, weight, bandWidth, other);
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
             }
             std::swap(cur, other);
@@ -383,8 +407,8 @@ reinitializeSdfCuda(const GridBatchData &batchHdl,
         ScalarT *rhs0         = rhs0Buf.data_ptr<ScalarT>();
         ScalarT *rhs1         = (order == 2) ? rhs1Buf.data_ptr<ScalarT>() : nullptr;
 
-        // gather: phi[0] = bandWidth (outside BC), phi[1..] = field; stage[0] = bandWidth (RK slot
-        // 0)
+        // gather: phi[1..] = field. Slot 0 of phi/stage is the background slot: filled with
+        // bandWidth for hygiene but never read by the stencil kernels (see faceValue) nor written.
         fillKernel<ScalarT>
             <<<GET_BLOCKS(valueCount, DEFAULT_BLOCK_DIM), DEFAULT_BLOCK_DIM, 0, stream>>>(
                 phi, valueCount, bandWidth);
