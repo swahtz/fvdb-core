@@ -46,7 +46,7 @@ class ConvolutionPhasePolicy(StrEnum):
 class SmoothingMode(IntEnum):
     """
     Laplacian smoothing mode used to de-staircase a signed distance field in
-    :meth:`fvdb.Grid.reinitialize_sdf` / :meth:`fvdb.Grid.retopologize_sdf` (and their
+    :meth:`fvdb.Grid.reinitialize_sdf` / :meth:`fvdb.Grid.rebuild_narrow_band` (and their
     :class:`fvdb.GridBatch` counterparts).
 
     The number of smoothing passes is controlled separately by the ``smooth`` argument; this enum

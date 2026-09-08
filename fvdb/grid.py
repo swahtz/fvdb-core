@@ -1546,7 +1546,7 @@ class Grid:
 
         return functional.reinitialize_sdf_single(self, field, band, smooth, order, smoothing, redistance_iters)
 
-    def retopologize_sdf(
+    def rebuild_narrow_band(
         self,
         field: torch.Tensor,
         band: int = 3,
@@ -1557,7 +1557,7 @@ class Grid:
         pad: bool = True,
         prune: bool = True,
     ) -> tuple[Grid, torch.Tensor]:
-        """Retopologize a signed field into a clean narrow-band SDF on a (possibly pruned) grid.
+        """Rebuild a signed field into a clean narrow-band SDF on a (possibly pruned) grid.
 
         If ``pad`` is ``True`` this grid is first dilated by ``band`` voxels so the redistance has
         room to build a full-width band, then :meth:`reinitialize_sdf` is run, and finally, if
@@ -1591,7 +1591,7 @@ class Grid:
         """
         from . import functional
 
-        return functional.retopologize_sdf_single(
+        return functional.rebuild_narrow_band_single(
             self, field, band, smooth, order, smoothing, redistance_iters, pad, prune
         )
 

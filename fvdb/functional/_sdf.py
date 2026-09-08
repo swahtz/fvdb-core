@@ -1,7 +1,7 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 #
-"""Functional API for signed-distance-field (SDF) re-initialization and narrow-band retopologization."""
+"""Functional API for signed-distance-field (SDF) re-initialization and narrow-band rebuild."""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -24,7 +24,7 @@ def _to_cpp_smoothing(smoothing: SmoothingMode) -> "_fvdb_cpp.SmoothingMode":
 
 
 # ---------------------------------------------------------------------------
-#  sign-aware padding (shared by retopologize_sdf_{single,batch})
+#  sign-aware padding (shared by rebuild_narrow_band_{single,batch})
 # ---------------------------------------------------------------------------
 
 
@@ -128,7 +128,7 @@ def reinitialize_sdf_batch(
         * Each grid must have isotropic voxels (``ValueError`` otherwise); grids in the batch may
           differ from one another. CUDA only; ``float32`` or ``float64``.
 
-    .. seealso:: :func:`reinitialize_sdf_single`, :func:`retopologize_sdf_batch`
+    .. seealso:: :func:`reinitialize_sdf_single`, :func:`rebuild_narrow_band_batch`
     """
     result = _fvdb_cpp.reinitialize_sdf(
         grid.data, field._impl, band, redistance_iters, order, smooth, _to_cpp_smoothing(smoothing)
@@ -167,7 +167,7 @@ def reinitialize_sdf_single(
         narrow bands with an inactive interior are both valid), exact-``0`` voxels are a no-data
         pass-through that neighbours see as an interface, and voxels must be isotropic.
 
-    .. seealso:: :func:`reinitialize_sdf_batch`, :func:`retopologize_sdf_single`
+    .. seealso:: :func:`reinitialize_sdf_batch`, :func:`rebuild_narrow_band_single`
     """
     field_jt = JaggedTensor(field)
     result = _fvdb_cpp.reinitialize_sdf(
@@ -177,11 +177,11 @@ def reinitialize_sdf_single(
 
 
 # ---------------------------------------------------------------------------
-#  retopologize_sdf  (reinitialize + narrow-band prune)
+#  rebuild_narrow_band  (pad + reinitialize + narrow-band prune)
 # ---------------------------------------------------------------------------
 
 
-def retopologize_sdf_batch(
+def rebuild_narrow_band_batch(
     grid: GridBatch,
     field: JaggedTensor,
     band: int = 3,
@@ -192,7 +192,7 @@ def retopologize_sdf_batch(
     pad: bool = True,
     prune: bool = True,
 ) -> tuple[GridBatch, JaggedTensor]:
-    """Retopologize a signed field into a clean narrow-band SDF on a (possibly pruned) grid batch.
+    """Rebuild a signed field into a clean narrow-band SDF on a (possibly pruned) grid batch.
 
     If ``pad`` is ``True`` the grid is first dilated by ``band`` voxels (so the eikonal solve has room
     to propagate a full-width band), then :func:`reinitialize_sdf_batch` is run, and finally, if
@@ -227,7 +227,7 @@ def retopologize_sdf_batch(
         Applying this to its own output reproduces it (up to a voxel layer at the band edge). See
         :func:`reinitialize_sdf_batch` for the input contract.
 
-    .. seealso:: :func:`retopologize_sdf_single`, :func:`reinitialize_sdf_batch`
+    .. seealso:: :func:`rebuild_narrow_band_single`, :func:`reinitialize_sdf_batch`
     """
     # per-grid narrow-band half-width; voxel size may vary across the batch
     band_width = band * grid.voxel_sizes[:, 0]
@@ -240,7 +240,7 @@ def retopologize_sdf_batch(
     return grid.pruned_grid(phi.jagged_like(mask)), phi.rmask(mask)
 
 
-def retopologize_sdf_single(
+def rebuild_narrow_band_single(
     grid: Grid,
     field: torch.Tensor,
     band: int = 3,
@@ -251,7 +251,7 @@ def retopologize_sdf_single(
     pad: bool = True,
     prune: bool = True,
 ) -> tuple[Grid, torch.Tensor]:
-    """Retopologize a signed field into a clean narrow-band SDF on a (possibly pruned) single grid.
+    """Rebuild a signed field into a clean narrow-band SDF on a (possibly pruned) single grid.
 
     If ``pad`` is ``True`` the grid is first dilated by ``band`` voxels (so the eikonal solve has room
     to propagate a full-width band), then :func:`reinitialize_sdf_single` is run, and finally, if
@@ -285,7 +285,7 @@ def retopologize_sdf_single(
         Applying this to its own output reproduces it (up to a voxel layer at the band edge). See
         :func:`reinitialize_sdf_batch` for the input contract.
 
-    .. seealso:: :func:`retopologize_sdf_batch`, :func:`reinitialize_sdf_single`
+    .. seealso:: :func:`rebuild_narrow_band_batch`, :func:`reinitialize_sdf_single`
     """
     # narrow-band half-width
     band_width = band * float(grid.voxel_size[0])

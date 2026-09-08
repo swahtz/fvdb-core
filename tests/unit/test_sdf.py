@@ -80,10 +80,10 @@ class ReinitializeSdfTests(unittest.TestCase):
         err = (phi[m] - self.analytic[m].double()).abs()
         self.assertLess(err.mean().item(), 0.25 * self.vx)
 
-    # ------------------------------------------------------------------ retopo
-    def test_retopologize_prune(self):
+    # ------------------------------------------------------------------ rebuild_narrow_band
+    def test_rebuild_prune(self):
         field = self.analytic.clamp(-self.bw, self.bw)
-        pruned, phi = self.grid.retopologize_sdf(field, band=self.band, prune=True)
+        pruned, phi = self.grid.rebuild_narrow_band(field, band=self.band, prune=True)
         self.assertEqual(phi.shape[0], pruned.num_voxels)
         self.assertLessEqual(pruned.num_voxels, self.grid.num_voxels)
         self.assertLess(phi.abs().max().item(), self.bw)  # strictly inside the band
@@ -95,13 +95,13 @@ class ReinitializeSdfTests(unittest.TestCase):
         field = self.analytic.clamp(-self.bw, self.bw)
         phi_full = self.grid.reinitialize_sdf(field, band=self.band)
         mask = phi_full.abs() < self.bw * 0.999
-        pruned, phi = self.grid.retopologize_sdf(field, band=self.band, prune=True)
+        pruned, phi = self.grid.rebuild_narrow_band(field, band=self.band, prune=True)
         self.assertTrue(torch.equal(self.grid.ijk[mask], pruned.ijk))
         self.assertTrue(torch.allclose(phi, phi_full[mask]))
 
     def test_no_prune_no_pad_returns_same_grid(self):
         field = self.analytic.clamp(-self.bw, self.bw)
-        grid_out, phi = self.grid.retopologize_sdf(field, band=self.band, pad=False, prune=False)
+        grid_out, phi = self.grid.rebuild_narrow_band(field, band=self.band, pad=False, prune=False)
         self.assertEqual(grid_out.num_voxels, self.grid.num_voxels)
         self.assertEqual(phi.shape[0], self.grid.num_voxels)
 
@@ -117,8 +117,8 @@ class ReinitializeSdfTests(unittest.TestCase):
         analytic = (g.ijk.float() * self.vx).norm(dim=1) - self.R
         field = analytic.clamp(-self.bw, self.bw)
 
-        g0, phi0 = g.retopologize_sdf(field, band=self.band, pad=False, prune=True)
-        g1, phi1 = g.retopologize_sdf(field, band=self.band, pad=True, prune=True)
+        g0, phi0 = g.rebuild_narrow_band(field, band=self.band, pad=False, prune=True)
+        g1, phi1 = g.rebuild_narrow_band(field, band=self.band, pad=True, prune=True)
 
         # padding produces a genuine multi-voxel exterior band; without it the band is truncated
         self.assertGreater((phi1 > 0.5 * self.vx).sum().item(), (phi0 > 0.5 * self.vx).sum().item())
@@ -159,12 +159,12 @@ class ReinitializeSdfTests(unittest.TestCase):
         # the deepest interior voxels still reach the band clamp
         self.assertLess(phi.min().item(), -(self.band - 1.25) * self.vx)
 
-    def test_retopologize_idempotent(self):
-        """retopologize_sdf applied to its own (interior-pruned) output must reproduce that output."""
+    def test_rebuild_idempotent(self):
+        """rebuild_narrow_band applied to its own (interior-pruned) output must reproduce that output."""
         field = self.analytic.clamp(-self.bw, self.bw)
-        g1, phi1 = self.grid.retopologize_sdf(field, band=self.band)
+        g1, phi1 = self.grid.rebuild_narrow_band(field, band=self.band)
         for pad in (False, True):
-            g2, phi2 = g1.retopologize_sdf(phi1, band=self.band, pad=pad)
+            g2, phi2 = g1.rebuild_narrow_band(phi1, band=self.band, pad=pad)
             a2 = (g2.ijk.float() * self.vx).norm(dim=1) - self.R
             err = (phi2 - a2).abs()
             self.assertLess(err.mean().item(), 0.25 * self.vx, f"pad={pad}")
@@ -176,7 +176,7 @@ class ReinitializeSdfTests(unittest.TestCase):
         """Padding a narrow band with an inactive interior must seed the inward layers negative."""
         g, analytic = self._narrow_band_grid()
         field = analytic.clamp(-self.bw, self.bw)
-        padded, phi = g.retopologize_sdf(field, band=self.band, pad=True, prune=False)
+        padded, phi = g.rebuild_narrow_band(field, band=self.band, pad=True, prune=False)
         a = (padded.ijk.float() * self.vx).norm(dim=1) - self.R
         interior_new = a < -self.bw  # voxels the padding added on the inside
         self.assertGreater(interior_new.sum().item(), 0)
@@ -190,8 +190,8 @@ class ReinitializeSdfTests(unittest.TestCase):
         field = analytic.clamp(-self.bw, self.bw)
         gb = fvdb.GridBatch.from_ijk(fvdb.JaggedTensor([g.ijk, g.ijk]), voxel_sizes=self.vx, origins=0.0)
         fb = gb.jagged_like(torch.cat([field, field]))
-        gb2, phib = gb.retopologize_sdf(fb, band=self.band, pad=True)
-        g2, phi = g.retopologize_sdf(field, band=self.band, pad=True)
+        gb2, phib = gb.rebuild_narrow_band(fb, band=self.band, pad=True)
+        g2, phi = g.rebuild_narrow_band(field, band=self.band, pad=True)
         for i in range(2):
             self.assertTrue(torch.equal(gb2[i].ijk.jdata, g2.ijk))
             self.assertTrue(torch.allclose(phib[i].jdata, phi, atol=1e-5))

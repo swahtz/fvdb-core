@@ -1107,7 +1107,7 @@ class GridBatch:
 
         return functional.reinitialize_sdf_batch(self, field, band, smooth, order, smoothing, redistance_iters)
 
-    def retopologize_sdf(
+    def rebuild_narrow_band(
         self,
         field: JaggedTensor,
         band: int = 3,
@@ -1118,7 +1118,7 @@ class GridBatch:
         pad: bool = True,
         prune: bool = True,
     ) -> tuple["GridBatch", JaggedTensor]:
-        """Retopologize a signed field into a clean narrow-band SDF on a (possibly pruned) grid batch.
+        """Rebuild a signed field into a clean narrow-band SDF on a (possibly pruned) grid batch.
 
         If ``pad`` is ``True`` the grid is first dilated by ``band`` voxels so the redistance has
         room to build a full-width band, then :meth:`reinitialize_sdf` is run, and finally, if
@@ -1150,11 +1150,11 @@ class GridBatch:
             See :meth:`reinitialize_sdf` for the input contract (sign trusted, inactive neighbours
             continue the adjacent sign, exact-``0`` voxels are no-data pass-through).
 
-        .. seealso:: :meth:`Grid.retopologize_sdf`
+        .. seealso:: :meth:`Grid.rebuild_narrow_band`
         """
         from . import functional
 
-        return functional.retopologize_sdf_batch(
+        return functional.rebuild_narrow_band_batch(
             self, field, band, smooth, order, smoothing, redistance_iters, pad, prune
         )
 

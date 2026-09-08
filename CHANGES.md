@@ -4,6 +4,16 @@ fVDB Version History
 ## Version 0.6.0 - In Development
 
 - **PyTorch 2.13** fVDB updated to build, test and publish with PyTorch 2.13, CUDA 13.0/13.2 and Python 3.10-3.15 support.
+- **Breaking:** `retopologize_sdf` is renamed `rebuild_narrow_band` (`Grid`, `GridBatch`, and
+  `fvdb.functional.rebuild_narrow_band_{single,batch}`); no alias is kept. The old name was mesh-remeshing jargon
+  and did not say that the op produces a *narrow-band* SDF on a rebuilt grid.
+- Fixed `reinitialize_sdf` treating every inactive voxel as exterior. An `IndexGrid` has a single background slot,
+  so a narrow band whose interior is inactive (a pruned level set, an imported OpenVDB grid, or
+  `rebuild_narrow_band`'s own output) grew a phantom interface one voxel inside the true surface; the zero crossing
+  survived, but the inner half of the band was wrong and `rebuild_narrow_band` was not idempotent. Inactive
+  neighbours now continue the sign of the adjacent active voxel, and `pad=True` seeds new voxels from their
+  neighbours' sign instead of as exterior. `reinitialize_sdf` also now raises `ValueError` for anisotropic voxels
+  instead of silently using only `voxel_size[0]`.
 - **Breaking:** Unified sparse convolution and transposed-convolution geometry around the componentwise Torch-phase
   relation ``fine_ijk = stride * coarse_ijk + tap_ijk - padding_before``, where
   ``padding_before = floor((kernel_size - 1) / 2)`` and each zero-based tap component satisfies

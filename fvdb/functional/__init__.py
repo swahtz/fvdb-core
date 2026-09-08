@@ -97,8 +97,8 @@ from ._meshing import (
 from ._sdf import (
     reinitialize_sdf_batch,
     reinitialize_sdf_single,
-    retopologize_sdf_batch,
-    retopologize_sdf_single,
+    rebuild_narrow_band_batch,
+    rebuild_narrow_band_single,
 )
 
 # Pooling / refinement
@@ -271,8 +271,8 @@ __all__ = [
     # Signed distance fields
     "reinitialize_sdf_batch",
     "reinitialize_sdf_single",
-    "retopologize_sdf_batch",
-    "retopologize_sdf_single",
+    "rebuild_narrow_band_batch",
+    "rebuild_narrow_band_single",
     # Topology
     "clip_batch",
     "clip_single",

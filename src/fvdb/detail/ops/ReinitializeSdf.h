@@ -40,7 +40,7 @@ enum class SmoothingMode : int32_t {
 ///                    continues the sign of the adjacent active voxel: -band*vx beside a negative
 ///                    (interior) voxel, +band*vx beside a positive (exterior) one. An IndexGrid has
 ///                    a single background slot, so this is how a narrow band with an inactive
-///                    interior (e.g. the output of retopologize_sdf) is kept solid rather than
+///                    interior (e.g. the output of rebuild_narrow_band) is kept solid rather than
 ///                    hollow.
 /// @param redistanceIters  Number of TVD-RK redistancing sweeps. Pass <= 0 to use the default
 ///                         max(6, round(2.5*band) + 2).
