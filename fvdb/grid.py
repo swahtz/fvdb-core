@@ -1539,8 +1539,8 @@ class Grid:
               ``0`` as a gap). Their signed neighbours, however, see them as an interface and are
               redistanced toward them, and smoothing blends them -- prune such voxels first when you
               can.
-            * Voxels are assumed isotropic (only ``voxel_size[0]`` is used). CUDA only; ``float32``
-              or ``float64``.
+            * Voxels must be isotropic (``ValueError`` otherwise). CUDA only; ``float32`` or
+              ``float64``.
         """
         from . import functional
 

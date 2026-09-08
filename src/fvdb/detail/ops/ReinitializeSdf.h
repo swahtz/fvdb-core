@@ -34,7 +34,7 @@ enum class SmoothingMode : int32_t {
 ///                    totalVoxels). Only its sign is trusted; magnitudes are rebuilt. A voxel whose
 ///                    value is exactly 0 has a zero frozen sign and is left at 0 by the redistance
 ///                    (no-data pass-through), though its signed neighbours see it as an interface.
-///                    Only voxelSize[0] is used (isotropic voxels assumed).
+///                    Voxels must be isotropic (a ValueError is raised otherwise).
 /// @param band        Narrow-band half-width in voxels. The field is clamped to [-band*vx, band*vx]
 ///                    each sweep. Inactive neighbours act as a Dirichlet boundary whose value
 ///                    continues the sign of the adjacent active voxel: -band*vx beside a negative

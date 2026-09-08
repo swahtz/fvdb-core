@@ -390,7 +390,23 @@ reinitializeSdfCuda(const GridBatchData &batchHdl,
         OnIndexGridT *grid =
             batchHdl.mGridHdl->deviceGrid<nanovdb::ValueOnIndex>((uint32_t)batchIdx);
         const int64_t voxelOffset = batchHdl.cumVoxelsAt(batchIdx);
-        const ScalarT voxelSize   = (ScalarT)batchHdl.voxelSizeAt(batchIdx)[0];
+        const nanovdb::Vec3d &vs  = batchHdl.voxelSizeAt(batchIdx);
+        // The eikonal solve uses one voxel size for all three axes; an anisotropic grid would get
+        // distances silently scaled by the aspect ratio along y/z. Relative tolerance absorbs
+        // float32 -> double round-off in voxel sizes that arrive from Python.
+        TORCH_CHECK_VALUE(std::abs(vs[1] - vs[0]) <= 1e-6 * vs[0] &&
+                              std::abs(vs[2] - vs[0]) <= 1e-6 * vs[0],
+                          "reinitialize_sdf requires isotropic voxels (the eikonal solve uses a "
+                          "single voxel size), but grid ",
+                          batchIdx,
+                          " has voxel_size (",
+                          vs[0],
+                          ", ",
+                          vs[1],
+                          ", ",
+                          vs[2],
+                          ")");
+        const ScalarT voxelSize = (ScalarT)vs[0];
         const ScalarT bandWidth = (ScalarT)band * voxelSize; // narrow-band half-width, world units
 
         VBMHelper vbm(grid, stream);

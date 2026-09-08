@@ -1098,8 +1098,8 @@ class GridBatch:
               ``0`` as a gap). Their signed neighbours, however, see them as an interface and are
               redistanced toward them, and smoothing blends them -- prune such voxels first when you
               can.
-            * Each grid is assumed isotropic (only ``voxel_sizes[:, 0]`` is used); grids in the
-              batch may have different voxel sizes. CUDA only; ``float32`` or ``float64``.
+            * Each grid must have isotropic voxels (``ValueError`` otherwise); grids in the batch
+              may differ from one another. CUDA only; ``float32`` or ``float64``.
 
         .. seealso:: :meth:`Grid.reinitialize_sdf`
         """

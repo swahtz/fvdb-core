@@ -196,6 +196,18 @@ class ReinitializeSdfTests(unittest.TestCase):
             self.assertTrue(torch.equal(gb2[i].ijk.jdata, g2.ijk))
             self.assertTrue(torch.allclose(phib[i].jdata, phi, atol=1e-5))
 
+    def test_anisotropic_voxels_rejected(self):
+        """The eikonal solve uses a single voxel size, so anisotropic grids must raise, not
+        silently return distances scaled along y/z."""
+        g = fvdb.Grid.from_ijk(self.grid.ijk, voxel_size=[self.vx, self.vx, 2 * self.vx], origin=0.0)
+        field = self.analytic.clamp(-self.bw, self.bw)
+        with self.assertRaisesRegex(ValueError, "isotropic"):
+            g.reinitialize_sdf(field, band=self.band)
+        # float32 round-off in an isotropic size must NOT trip the check
+        g_iso = fvdb.Grid.from_ijk(self.grid.ijk, voxel_size=torch.tensor([0.1, 0.1, 0.1]), origin=0.0)
+        phi = g_iso.reinitialize_sdf(field, band=self.band)
+        self.assertEqual(phi.shape[0], g_iso.num_voxels)
+
     # ------------------------------------------------------------------ batch
     def test_batch_matches_single(self):
         vx = self.vx

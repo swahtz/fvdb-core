@@ -125,8 +125,8 @@ def reinitialize_sdf_batch(
           treats exact ``0`` as a gap). Their signed neighbours, however, see them as an interface and
           are redistanced toward them, and smoothing blends them -- prune such voxels first when you
           can.
-        * Each grid is assumed isotropic (only ``voxel_sizes[:, 0]`` is used). CUDA only;
-          ``float32`` or ``float64``.
+        * Each grid must have isotropic voxels (``ValueError`` otherwise); grids in the batch may
+          differ from one another. CUDA only; ``float32`` or ``float64``.
 
     .. seealso:: :func:`reinitialize_sdf_single`, :func:`retopologize_sdf_batch`
     """
@@ -165,7 +165,7 @@ def reinitialize_sdf_single(
         See :func:`reinitialize_sdf_batch` for the input contract: only the sign of ``field`` is
         trusted, inactive neighbours continue the sign of the adjacent voxel (filled solids and
         narrow bands with an inactive interior are both valid), exact-``0`` voxels are a no-data
-        pass-through that neighbours see as an interface, and voxels are assumed isotropic.
+        pass-through that neighbours see as an interface, and voxels must be isotropic.
 
     .. seealso:: :func:`reinitialize_sdf_batch`, :func:`retopologize_sdf_single`
     """
