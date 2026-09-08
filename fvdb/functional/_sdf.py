@@ -113,6 +113,21 @@ def reinitialize_sdf_batch(
     Returns:
         sdf (JaggedTensor): The re-initialized SDF, same per-voxel ordering as ``field``.
 
+    Note:
+        * Only the **sign** of ``field`` is trusted; magnitudes are rebuilt. With ``smooth=0`` the
+          input's zero crossing is preserved (to sub-voxel accuracy); smoothing moves the surface to
+          its de-staircased position and then re-redistances.
+        * Inactive neighbours read as ``+/-band*vx`` with the sign of the adjacent active voxel, so
+          both filled solids (interior active) and narrow bands whose interior is inactive are valid
+          inputs. Voxels with no data are best left *inactive* rather than given a value.
+        * Voxels whose value is exactly ``0`` have a zero frozen sign and are left at ``0`` by the
+          redistance (a no-data pass-through relied on by the ray-implicit-intersection op, which
+          treats exact ``0`` as a gap). Their signed neighbours, however, see them as an interface and
+          are redistanced toward them, and smoothing blends them -- prune such voxels first when you
+          can.
+        * Each grid is assumed isotropic (only ``voxel_sizes[:, 0]`` is used). CUDA only;
+          ``float32`` or ``float64``.
+
     .. seealso:: :func:`reinitialize_sdf_single`, :func:`retopologize_sdf_batch`
     """
     result = _fvdb_cpp.reinitialize_sdf(
@@ -145,6 +160,12 @@ def reinitialize_sdf_single(
 
     Returns:
         sdf (torch.Tensor): The re-initialized SDF, shape ``(num_voxels,)``.
+
+    Note:
+        See :func:`reinitialize_sdf_batch` for the input contract: only the sign of ``field`` is
+        trusted, inactive neighbours continue the sign of the adjacent voxel (filled solids and
+        narrow bands with an inactive interior are both valid), exact-``0`` voxels are a no-data
+        pass-through that neighbours see as an interface, and voxels are assumed isotropic.
 
     .. seealso:: :func:`reinitialize_sdf_batch`, :func:`retopologize_sdf_single`
     """
@@ -202,6 +223,10 @@ def retopologize_sdf_batch(
         out_grid (GridBatch): The pruned (or, with ``prune=False``, the padded/original) grid batch.
         sdf (JaggedTensor): The narrow-band SDF, aligned with ``out_grid``.
 
+    Note:
+        Applying this to its own output reproduces it (up to a voxel layer at the band edge). See
+        :func:`reinitialize_sdf_batch` for the input contract.
+
     .. seealso:: :func:`retopologize_sdf_single`, :func:`reinitialize_sdf_batch`
     """
     # per-grid narrow-band half-width; voxel size may vary across the batch
@@ -255,6 +280,10 @@ def retopologize_sdf_single(
     Returns:
         out_grid (Grid): The pruned (or, with ``prune=False``, the padded/original) grid.
         sdf (torch.Tensor): The narrow-band SDF, aligned with ``out_grid``.
+
+    Note:
+        Applying this to its own output reproduces it (up to a voxel layer at the band edge). See
+        :func:`reinitialize_sdf_batch` for the input contract.
 
     .. seealso:: :func:`retopologize_sdf_batch`, :func:`reinitialize_sdf_single`
     """

@@ -1521,10 +1521,26 @@ class Grid:
             smoothing (SmoothingMode): Which Laplacian flow each smoothing pass applies --
                 :attr:`~fvdb.SmoothingMode.MEAN_CURVATURE` (default) or
                 :attr:`~fvdb.SmoothingMode.TAUBIN` (volume-preserving). Only used when ``smooth > 0``.
-            redistance_iters (int): Number of redistancing sweeps; ``<= 0`` uses the default.
+            redistance_iters (int): Number of redistancing sweeps; ``<= 0`` uses the default
+                ``max(6, round(2.5*band) + 2)``.
 
         Returns:
             sdf (torch.Tensor): The re-initialized SDF, shape ``(num_voxels,)``.
+
+        Note:
+            * Only the **sign** of ``field`` is trusted; magnitudes are rebuilt. With ``smooth=0``
+              the input's zero crossing is preserved (to sub-voxel accuracy); smoothing moves the
+              surface to its de-staircased position and then re-redistances.
+            * Inactive neighbours read as ``+/-band*vx`` with the sign of the adjacent active voxel,
+              so both filled solids (interior active) and narrow bands whose interior is inactive are
+              valid inputs. Voxels with no data are best left *inactive* rather than given a value.
+            * Voxels whose value is exactly ``0`` have a zero frozen sign and are left at ``0`` by the
+              redistance (a no-data pass-through; :meth:`ray_implicit_intersection` treats exact
+              ``0`` as a gap). Their signed neighbours, however, see them as an interface and are
+              redistanced toward them, and smoothing blends them -- prune such voxels first when you
+              can.
+            * Voxels are assumed isotropic (only ``voxel_size[0]`` is used). CUDA only; ``float32``
+              or ``float64``.
         """
         from . import functional
 
@@ -1558,14 +1574,20 @@ class Grid:
                 :attr:`~fvdb.SmoothingMode.TAUBIN` (volume-preserving). Only used when ``smooth > 0``.
             redistance_iters (int): Number of redistancing sweeps; ``<= 0`` uses the default.
             pad (bool): If ``True`` (default) dilate by ``band`` first so the output band is a full
-                ``band`` voxels wide even if the input grid was thinner. New voxels are seeded as
-                exterior (``+band*vx``), which is correct when the interior (``phi < 0``) is already
-                represented; for a hollow thin shell, pass ``pad=False`` with a pre-banded grid.
+                ``band`` voxels wide even if the input grid was thinner. The dilation grows one layer
+                at a time and seeds each new voxel with ``+/-band*vx`` according to the sign of its
+                existing neighbours, so it continues the band inward (interior) as well as outward and
+                works for filled solids and for narrow bands whose interior is inactive.
             prune (bool): If ``True`` prune to the narrow band, else return the (padded) grid.
 
         Returns:
             out_grid (Grid): The pruned (or padded/original) grid.
             sdf (torch.Tensor): The narrow-band SDF, aligned with ``out_grid``.
+
+        Note:
+            Applying this to its own output reproduces it (up to a voxel layer at the band edge).
+            See :meth:`reinitialize_sdf` for the input contract (sign trusted, inactive neighbours
+            continue the adjacent sign, exact-``0`` voxels are no-data pass-through).
         """
         from . import functional
 

@@ -50,7 +50,11 @@ class SmoothingMode(IntEnum):
     :class:`fvdb.GridBatch` counterparts).
 
     The number of smoothing passes is controlled separately by the ``smooth`` argument; this enum
-    selects *which* umbrella-Laplacian flow each pass applies. Values mirror the C++
+    selects *which* umbrella-Laplacian flow each pass applies. Smoothing runs after the redistance
+    and is followed by a short second redistance (with a freshly computed sign) so ``|grad phi| = 1``
+    is restored; unlike a pure redistance it therefore *moves* the zero crossing to the smoothed
+    surface. Thin (about one voxel) features can be eroded by :attr:`MEAN_CURVATURE`; prefer
+    :attr:`TAUBIN` or ``smooth=0`` for them. Values mirror the C++
     ``fvdb::detail::ops::SmoothingMode`` enum.
     """
 

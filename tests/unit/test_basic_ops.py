@@ -2148,8 +2148,9 @@ class TestBasicOps(unittest.TestCase):
         # spurious crossing seeded by the no-data prefix.
         #
         # Sparse fvdb SDFs (e.g. integrate_tsdf + reinitialize_sdf) leave
-        # active-but-unobserved voxels outside the narrow band at exactly
-        # 0. Mathematically sgn(0) == 0, so if the kernel treated 0 as a
+        # active-but-unobserved voxels at exactly 0: reinitialize_sdf gives
+        # an exactly-0 voxel a zero frozen sign and never moves it.
+        # Mathematically sgn(0) == 0, so if the kernel treated 0 as a
         # real sign it would latch the very first 0 voxel as its reference
         # and flag a "sign change" the instant the ray reached the first
         # signed (+/-) voxel — collapsing the hit to ~a voxel from the

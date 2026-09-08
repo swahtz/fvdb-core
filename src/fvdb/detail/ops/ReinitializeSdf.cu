@@ -83,7 +83,9 @@ faceValue(const ScalarT *field, uint64_t index, ScalarT center, ScalarT bandWidt
                   zp = faceValue<ScalarT>(field, faceIndex[5], centerValue, bandWidth)
 
 // =====================  fused stencil kernels ====================================================
-// frozen Peng smoothed sign from a field's value + central-difference gradient.
+// frozen Peng smoothed sign from a field's value + central-difference gradient. An exactly-0 centre
+// yields sign 0, so the Godunov RHS vanishes there and such (no-data) voxels are never moved by the
+// redistance; the ray-implicit-intersection op relies on exact 0 surviving as a gap marker.
 template <typename ScalarT>
 __global__ void
 signFusedKernel(const OnIndexGridT *grid,
