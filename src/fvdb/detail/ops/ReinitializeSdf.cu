@@ -34,7 +34,8 @@ static constexpr int kLog2BlockWidth = 9;
 // neighbours through a cached ReadAccessor. Yields `centerIndex` (the centre voxel's value index)
 // and `faceIndex[6]` (the 6 face-neighbour value indices, -x,+x,-y,+y,-z,+z; 0 =
 // inactive/background). Kernels using it take the grid/firstLeafID/jumpMap/firstOffset parameters
-// by these exact names.
+// by these exact names. Neighbour VALUES must be read through `faceValue` (below), never
+// `field[faceIndex[k]]` directly, so that inactive neighbours get a sign-aware boundary value.
 #define VBM_FACES_BEGIN()                                                                        \
     constexpr int blockWidth = 1 << kLog2BlockWidth, jumpMapWordCount = blockWidth / 64;         \
     using VoxelBlockManagerT = nanovdb::tools::cuda::VoxelBlockManager<kLog2BlockWidth>;         \
@@ -60,8 +61,32 @@ static constexpr int kLog2BlockWidth = 9;
                                         accessor.getValue(centerCoord.offsetBy(0, 0, -1)),       \
                                         accessor.getValue(centerCoord.offsetBy(0, 0, 1))};
 
+// Sign-aware read of a face neighbour. An IndexGrid has a single background slot (value index 0),
+// so it cannot carry OpenVDB's two-signed inactive tiles (-background inside, +background outside).
+// Instead, an inactive neighbour continues the supplied sign: beside a negative voxel it
+// is deep interior (-bandWidth), beside a positive voxel deep exterior (+bandWidth). Without this
+// the inner edge of a narrow band sees +bandWidth across the face and a phantom interface forms
+// one voxel inside the true surface. Godunov updates supply the frozen sign; sign computation and
+// smoothing supply the current centre value. Active neighbours use the value-indexed buffer.
+template <typename ScalarT>
+__device__ inline ScalarT
+faceValue(const ScalarT *field, uint64_t index, ScalarT signSource, ScalarT bandWidth) {
+    return index ? field[index] : (signSource < ScalarT(0) ? -bandWidth : bandWidth);
+}
+
+// Reads the 6 face neighbours, using `signSource` for inactive values.
+#define VBM_FACE_VALUES(field, signSource, bandWidth)                                  \
+    const ScalarT xm = faceValue<ScalarT>(field, faceIndex[0], signSource, bandWidth), \
+                  xp = faceValue<ScalarT>(field, faceIndex[1], signSource, bandWidth), \
+                  ym = faceValue<ScalarT>(field, faceIndex[2], signSource, bandWidth), \
+                  yp = faceValue<ScalarT>(field, faceIndex[3], signSource, bandWidth), \
+                  zm = faceValue<ScalarT>(field, faceIndex[4], signSource, bandWidth), \
+                  zp = faceValue<ScalarT>(field, faceIndex[5], signSource, bandWidth)
+
 // =====================  fused stencil kernels ====================================================
-// frozen Peng smoothed sign from a field's value + central-difference gradient.
+// frozen Peng smoothed sign from a field's value + central-difference gradient. An exactly-0 centre
+// yields sign 0, so the Godunov RHS vanishes there and such (no-data) voxels are never moved by the
+// redistance; the ray-implicit-intersection op relies on exact 0 surviving as a gap marker.
 template <typename ScalarT>
 __global__ void
 signFusedKernel(const OnIndexGridT *grid,
@@ -70,12 +95,14 @@ signFusedKernel(const OnIndexGridT *grid,
                 uint64_t firstOffset,
                 const ScalarT *field,
                 ScalarT voxelSize,
+                ScalarT bandWidth,
                 ScalarT *sign) {
     VBM_FACES_BEGIN();
-    ScalarT xm = field[faceIndex[0]], xp = field[faceIndex[1]], ym = field[faceIndex[2]],
-            yp = field[faceIndex[3]], zm = field[faceIndex[4]], zp = field[faceIndex[5]];
-    ScalarT gradX = (xp - xm) / (2 * voxelSize), gradY = (yp - ym) / (2 * voxelSize),
-            gradZ = (zp - zm) / (2 * voxelSize), phiCenter = field[centerIndex];
+    const ScalarT phiCenter = field[centerIndex];
+    VBM_FACE_VALUES(field, phiCenter, bandWidth);
+    ScalarT gradX = (xp - xm) / (2 * voxelSize);
+    ScalarT gradY = (yp - ym) / (2 * voxelSize);
+    ScalarT gradZ = (zp - zm) / (2 * voxelSize);
     sign[centerIndex] =
         phiCenter / nanovdb::math::Sqrt(phiCenter * phiCenter +
                                         (gradX * gradX + gradY * gradY + gradZ * gradZ) *
@@ -108,11 +135,13 @@ godunovFusedKernel(const OnIndexGridT *grid,
                    const ScalarT *field,
                    const ScalarT *sign,
                    ScalarT voxelSize,
+                   ScalarT bandWidth,
                    ScalarT *rhs) {
     VBM_FACES_BEGIN();
-    ScalarT center = field[centerIndex], sgn = sign[centerIndex];
-    ScalarT xm = field[faceIndex[0]], xp = field[faceIndex[1]], ym = field[faceIndex[2]],
-            yp = field[faceIndex[3]], zm = field[faceIndex[4]], zp = field[faceIndex[5]];
+    const ScalarT center = field[centerIndex], sgn = sign[centerIndex];
+    // Match upwind's frozen sign even if an RK stage crosses zero. For clamped stage values,
+    // inactive faces then remain downwind instead of introducing a spurious boundary slope.
+    VBM_FACE_VALUES(field, sgn, bandWidth);
     ScalarT gradMag = nanovdb::math::Sqrt(
         upwind<ScalarT>((center - xm) / voxelSize, (xp - center) / voxelSize, sgn) +
         upwind<ScalarT>((center - ym) / voxelSize, (yp - center) / voxelSize, sgn) +
@@ -130,12 +159,12 @@ smoothFusedKernel(const OnIndexGridT *grid,
                   uint64_t firstOffset,
                   const ScalarT *in,
                   ScalarT weight,
+                  ScalarT bandWidth,
                   ScalarT *out) {
     VBM_FACES_BEGIN();
-    ScalarT center   = in[centerIndex];
-    ScalarT faceMean = (in[faceIndex[0]] + in[faceIndex[1]] + in[faceIndex[2]] + in[faceIndex[3]] +
-                        in[faceIndex[4]] + in[faceIndex[5]]) *
-                       (ScalarT(1) / ScalarT(6));
+    const ScalarT center = in[centerIndex];
+    VBM_FACE_VALUES(in, center, bandWidth);
+    ScalarT faceMean = (xm + xp + ym + yp + zm + zp) * (ScalarT(1) / ScalarT(6));
     out[centerIndex] = center + weight * (faceMean - center);
 }
 
@@ -212,9 +241,10 @@ struct VBMHelper {
 };
 
 // Redistance (|grad phi| = 1) + optional de-staircase one grid's value-indexed buffer, in place.
-// `phi`/scratch are length `valueCount` with slot 0 holding the +bandWidth background; the
-// stencil/combiner kernels never write slot 0 (so inactive-neighbour reads always see the boundary
-// value).
+// `phi`/scratch are length `valueCount`; slot 0 is the (never written) background slot. Stencil
+// kernels do not read slot 0: inactive neighbours are resolved by `faceValue` to
+// +/-bandWidth using the frozen sign for Godunov updates and the current centre sign otherwise,
+// so a narrow band with an inactive interior is treated as continuing inward, not as exterior.
 template <typename ScalarT>
 void
 runReinit(OnIndexGridT *grid,
@@ -244,14 +274,14 @@ runReinit(OnIndexGridT *grid,
     auto godunov = [&](const ScalarT *field, ScalarT *out) {
         if (blockCount) {
             godunovFusedKernel<ScalarT><<<blockCount, blockWidth, 0, stream>>>(
-                grid, firstLeafID, jumpMap, firstOffset, field, sign, voxelSize, out);
+                grid, firstLeafID, jumpMap, firstOffset, field, sign, voxelSize, bandWidth, out);
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
     };
     auto redistance = [&](int iters) {
         if (blockCount) {
             signFusedKernel<ScalarT><<<blockCount, blockWidth, 0, stream>>>(
-                grid, firstLeafID, jumpMap, firstOffset, phi, voxelSize, sign);
+                grid, firstLeafID, jumpMap, firstOffset, phi, voxelSize, bandWidth, sign);
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
         for (int it = 0; it < iters; ++it) {
@@ -316,11 +346,11 @@ runReinit(OnIndexGridT *grid,
     redistance(redistanceIters > 0 ? redistanceIters : defaultIters);
 
     if (smooth) {
-        ScalarT *cur = phi, *other = stage; // ping-pong (stage[0] already = bandWidth)
+        ScalarT *cur = phi, *other = stage; // ping-pong; stencil reads do not use slot 0
         auto pass = [&](ScalarT weight) {
             if (blockCount) {
                 smoothFusedKernel<ScalarT><<<blockCount, blockWidth, 0, stream>>>(
-                    grid, firstLeafID, jumpMap, firstOffset, cur, weight, other);
+                    grid, firstLeafID, jumpMap, firstOffset, cur, weight, bandWidth, other);
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
             }
             std::swap(cur, other);
@@ -364,7 +394,23 @@ reinitializeSdfCuda(const GridBatchData &batchHdl,
         OnIndexGridT *grid =
             batchHdl.mGridHdl->deviceGrid<nanovdb::ValueOnIndex>((uint32_t)batchIdx);
         const int64_t voxelOffset = batchHdl.cumVoxelsAt(batchIdx);
-        const ScalarT voxelSize   = (ScalarT)batchHdl.voxelSizeAt(batchIdx)[0];
+        const nanovdb::Vec3d &vs  = batchHdl.voxelSizeAt(batchIdx);
+        // The eikonal solve uses one voxel size for all three axes; an anisotropic grid would get
+        // distances silently scaled by the aspect ratio along y/z. Relative tolerance absorbs
+        // float32 -> double round-off in voxel sizes that arrive from Python.
+        TORCH_CHECK_VALUE(std::abs(vs[1] - vs[0]) <= 1e-6 * vs[0] &&
+                              std::abs(vs[2] - vs[0]) <= 1e-6 * vs[0],
+                          "reinitialize_sdf requires isotropic voxels (the eikonal solve uses a "
+                          "single voxel size), but grid ",
+                          batchIdx,
+                          " has voxel_size (",
+                          vs[0],
+                          ", ",
+                          vs[1],
+                          ", ",
+                          vs[2],
+                          ")");
+        const ScalarT voxelSize = (ScalarT)vs[0];
         const ScalarT bandWidth = (ScalarT)band * voxelSize; // narrow-band half-width, world units
 
         VBMHelper vbm(grid, stream);
@@ -383,8 +429,8 @@ reinitializeSdfCuda(const GridBatchData &batchHdl,
         ScalarT *rhs0         = rhs0Buf.data_ptr<ScalarT>();
         ScalarT *rhs1         = (order == 2) ? rhs1Buf.data_ptr<ScalarT>() : nullptr;
 
-        // gather: phi[0] = bandWidth (outside BC), phi[1..] = field; stage[0] = bandWidth (RK slot
-        // 0)
+        // gather: phi[1..] = field. Slot 0 of phi/stage is the background slot: filled with
+        // bandWidth for hygiene but never read by the stencil kernels (see faceValue) nor written.
         fillKernel<ScalarT>
             <<<GET_BLOCKS(valueCount, DEFAULT_BLOCK_DIM), DEFAULT_BLOCK_DIM, 0, stream>>>(
                 phi, valueCount, bandWidth);
@@ -442,6 +488,10 @@ reinitializeSdf(const GridBatchData &batchHdl,
         field.ldim() == 1,
         "Expected field to have 1 list dimension (a single list of per-voxel values)");
     TORCH_CHECK_TYPE(field.is_floating_point(), "field must have a floating point type");
+    const auto &data = field.jdata();
+    TORCH_CHECK_VALUE(data.dim() == 1 || (data.dim() == 2 && data.size(1) == 1),
+                      "field must be a scalar field with shape (N,) or (N, 1), got ",
+                      data.sizes());
     TORCH_CHECK_VALUE(field.numel() == batchHdl.totalVoxels(),
                       "field value count does not match the number of voxels in the grid");
     TORCH_CHECK_VALUE(field.num_outer_lists() == batchHdl.batchSize(),
@@ -457,6 +507,8 @@ reinitializeSdf(const GridBatchData &batchHdl,
                      "reinitialize_sdf supports float32 or float64 fields");
 
     torch::Tensor fieldJdata = field.jdata().contiguous();
+    TORCH_CHECK_VALUE(torch::isfinite(fieldJdata).all().item<bool>(),
+                      "field must contain only finite values; leave no-data voxels inactive");
     if (fieldJdata.dim() != 1)
         fieldJdata = fieldJdata.view({-1});
 
