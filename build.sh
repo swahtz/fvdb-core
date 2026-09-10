@@ -13,6 +13,8 @@ usage() {
   echo "                   wheel      - Build the Python wheel."
   echo "                   ctest      - Run tests (requires tests to be built)."
   echo "                   docstest   - Run pytest markdown documentation tests."
+  echo "                   format     - Run clang-format and black over the repo (matches CI)."
+  echo "                                Pass 'check' to report violations without rewriting files."
   echo ""
   echo "Options:"
   echo "  -h, --help     Display this help message and exit."
@@ -235,7 +237,7 @@ _first_arg_val="$1"
 BUILD_TYPE="install" # Default build type
 
 if [[ -n "$_first_arg_val" ]]; then
-  if [[ "$_first_arg_val" == "install" || "$_first_arg_val" == "wheel" || "$_first_arg_val" == "ctest" || "$_first_arg_val" == "docstest" ]]; then
+  if [[ "$_first_arg_val" == "install" || "$_first_arg_val" == "wheel" || "$_first_arg_val" == "ctest" || "$_first_arg_val" == "docstest" || "$_first_arg_val" == "format" ]]; then
     BUILD_TYPE="$_first_arg_val"
     shift # Consume the build_type argument
   else
@@ -367,6 +369,33 @@ fi
 # Construct PIP_ARGS with potential CMake args and other pass-through args
 export PIP_ARGS="--no-build-isolation$CONFIG_SETTINGS$PASS_THROUGH_ARGS"
 
+if [ "$BUILD_TYPE" == "format" ]; then
+    # Formatting needs no CUDA or build-job setup. Black reads its
+    # settings from pyproject.toml, so no flags are duplicated here.
+    FORMAT_MODE="${PASS_THROUGH_ARGS# }"
+    FORMAT_MODE="${FORMAT_MODE:-format}"
+    if [[ "$FORMAT_MODE" != "format" && "$FORMAT_MODE" != "check" ]]; then
+        echo "Error: 'format' accepts an optional 'check' argument, got: $FORMAT_MODE"
+        exit 1
+    fi
+    FORMAT_EXIT_CODE=0
+
+    echo "Running clang-format ($FORMAT_MODE)"
+    ./src/scripts/run_clang_format.sh "$FORMAT_MODE" || FORMAT_EXIT_CODE=$?
+
+    echo "Running black ($FORMAT_MODE)"
+    if ! python -c "import black" >/dev/null 2>&1; then
+        echo "Error: black is not installed. Install with: python -m pip install \"black~=24.0\""
+        exit 127
+    fi
+    if [ "$FORMAT_MODE" == "check" ]; then
+        python -m black --check --diff . || FORMAT_EXIT_CODE=$?
+    else
+        python -m black . || FORMAT_EXIT_CODE=$?
+    fi
+    exit $FORMAT_EXIT_CODE
+fi
+
 # Detect and export CUDA architectures early so builds pick it up
 set_cuda_arch_list "$CUDA_ARCH_LIST_ARG"
 
@@ -468,6 +497,6 @@ elif [ "$BUILD_TYPE" == "docstest" ]; then
 
 else
     echo "Invalid build/run type: $BUILD_TYPE"
-    echo "Valid build/run types are: wheel, install, ctest, docstest"
+    echo "Valid build/run types are: wheel, install, ctest, docstest, format"
     exit 1
 fi
