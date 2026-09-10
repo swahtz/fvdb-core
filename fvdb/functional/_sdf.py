@@ -167,10 +167,7 @@ def reinitialize_sdf_single(
         sdf (torch.Tensor): The re-initialized SDF, shape ``(num_voxels,)``.
 
     Note:
-        See :func:`reinitialize_sdf_batch` for the input contract: only the sign of ``field`` is
-        trusted, inactive neighbours continue the sign of the adjacent voxel (filled solids and
-        narrow bands with an inactive interior are both valid), exact-``0`` voxels are a no-data
-        pass-through that neighbours see as an interface, and voxels must be isotropic.
+        See :func:`reinitialize_sdf_batch` for the input contract.
 
     .. seealso:: :func:`reinitialize_sdf_batch`, :func:`rebuild_narrow_band_single`
     """

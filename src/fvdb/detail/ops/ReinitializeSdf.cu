@@ -99,8 +99,9 @@ signFusedKernel(const OnIndexGridT *grid,
     VBM_FACES_BEGIN();
     const ScalarT phiCenter = field[centerIndex];
     VBM_FACE_VALUES(field, phiCenter, bandWidth);
-    ScalarT gradX = (xp - xm) / (2 * voxelSize), gradY = (yp - ym) / (2 * voxelSize),
-            gradZ = (zp - zm) / (2 * voxelSize);
+    ScalarT gradX = (xp - xm) / (2 * voxelSize);
+    ScalarT gradY = (yp - ym) / (2 * voxelSize);
+    ScalarT gradZ = (zp - zm) / (2 * voxelSize);
     sign[centerIndex] =
         phiCenter / nanovdb::math::Sqrt(phiCenter * phiCenter +
                                         (gradX * gradX + gradY * gradY + gradZ * gradZ) *
