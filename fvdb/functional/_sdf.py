@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 """Functional API for signed-distance-field (SDF) re-initialization and narrow-band rebuild."""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -21,6 +22,17 @@ if TYPE_CHECKING:
 def _to_cpp_smoothing(smoothing: SmoothingMode) -> "_fvdb_cpp.SmoothingMode":
     """Convert a public :class:`fvdb.SmoothingMode` to the bound C++ enum (matched by member name)."""
     return getattr(_fvdb_cpp.SmoothingMode, smoothing.name)
+
+
+def _validated_scalar_field(field: torch.Tensor, num_voxels: int) -> torch.Tensor:
+    """Validate before padding, where NaN is reserved for newly activated voxels."""
+    if field.dim() not in (1, 2) or (field.dim() == 2 and field.shape[1] != 1):
+        raise ValueError(f"field must be a scalar field with shape (N,) or (N, 1), got {tuple(field.shape)}")
+    if field.shape[0] != num_voxels:
+        raise ValueError(f"field must have one value per voxel, got {field.shape[0]} values for {num_voxels} voxels")
+    if not torch.isfinite(field).all().item():
+        raise ValueError("field must contain only finite values; leave no-data voxels inactive")
+    return field.reshape(-1)
 
 
 # ---------------------------------------------------------------------------
@@ -114,17 +126,21 @@ def reinitialize_sdf_batch(
         sdf (JaggedTensor): The re-initialized SDF, same per-voxel ordering as ``field``.
 
     Note:
-        * Only the **sign** of ``field`` is trusted; magnitudes are rebuilt. With ``smooth=0`` the
-          input's zero crossing is preserved (to sub-voxel accuracy); smoothing moves the surface to
-          its de-staircased position and then re-redistances.
+        * ``field`` must represent the intended inside/outside regions and zero crossings. Its
+          magnitudes need not be accurate distances, but affect convergence, accuracy, and sub-voxel
+          surface location. With ``smooth=0`` redistancing aims to preserve the input surface, subject
+          to discretization error; smoothing moves the surface and then re-redistances.
+        * Values must be finite, with shape ``(N,)`` or ``(N, 1)`` (for a batch, the shape of
+          ``field.jdata``). Invalid shapes and NaN/Inf values raise ``ValueError``.
         * The surface is where the field changes sign between *active* voxels; one active voxel of
           each sign across the crossing is sufficient (two or more per side gives the best sub-voxel
           accuracy). A grid whose active values are all one sign has no surface: the result is the
           constant ``-/+band*vx`` and :func:`rebuild_narrow_band_batch` returns an empty band, which
           is correct for e.g. a tile that lies entirely inside an object.
-        * Inactive neighbours read as ``+/-band*vx`` with the sign of the adjacent active voxel, so
-          both filled solids (interior active) and narrow bands whose interior is inactive are valid
-          inputs. Voxels with no data are best left *inactive* rather than given a value.
+        * Inactive neighbours read as ``+/-band*vx`` using the adjacent voxel's frozen sign during
+          redistancing and its current sign during smoothing. Both filled solids (interior active)
+          and narrow bands whose interior is inactive are valid inputs. Leave no-data voxels
+          *inactive* rather than assigning them NaN/Inf values.
         * Voxels whose value is exactly ``0`` have a zero frozen sign and are left at ``0`` by the
           redistance (a no-data pass-through relied on by the ray-implicit-intersection op, which
           treats exact ``0`` as a gap). Their signed neighbours, however, see them as an interface and
@@ -154,7 +170,7 @@ def reinitialize_sdf_single(
 
     Args:
         grid (Grid): The single grid defining the sparse topology.
-        field (torch.Tensor): Per-voxel signed field values, shape ``(num_voxels,)``.
+        field (torch.Tensor): Per-voxel signed field values, shape ``(num_voxels,)`` or ``(num_voxels, 1)``.
         band (int): Narrow-band half-width in voxels.
         smooth (int): Number of smoothing passes (``0`` disables smoothing).
         order (int): TVD-RK order, one of ``1``, ``2``, or ``3``.
@@ -233,10 +249,7 @@ def rebuild_narrow_band_batch(
     """
     # per-grid narrow-band half-width; voxel size may vary across the batch
     band_width = band * grid.voxel_sizes[:, 0]
-    # Canonicalize scalar fields to flat per-voxel storage: reinitialize_sdf accepts (N, 1) (and
-    # returns (N,)), and the padding masks below must be one-dimensional.
-    if field.jdata.dim() != 1:
-        field = field.jagged_like(field.jdata.reshape(-1))
+    field = field.jagged_like(_validated_scalar_field(field.jdata, grid.total_voxels))
     if pad:
         grid, field = _pad_with_sign_batch(grid, field, band, band_width)
     phi = reinitialize_sdf_batch(grid, field, band, smooth, order, smoothing, redistance_iters)
@@ -266,7 +279,7 @@ def rebuild_narrow_band_single(
 
     Args:
         grid (Grid): The single grid defining the sparse topology.
-        field (torch.Tensor): Per-voxel signed field values, shape ``(num_voxels,)``.
+        field (torch.Tensor): Per-voxel signed field values, shape ``(num_voxels,)`` or ``(num_voxels, 1)``.
         band (int): Narrow-band half-width in voxels.
         smooth (int): Number of smoothing passes (``0`` disables smoothing).
         order (int): TVD-RK order, one of ``1``, ``2``, or ``3``.
@@ -295,10 +308,7 @@ def rebuild_narrow_band_single(
     """
     # narrow-band half-width
     band_width = band * float(grid.voxel_size[0])
-    # Canonicalize scalar fields to flat per-voxel storage: reinitialize_sdf accepts (N, 1) (and
-    # returns (N,)), and the padding masks below must be one-dimensional.
-    if field.dim() != 1:
-        field = field.reshape(-1)
+    field = _validated_scalar_field(field, grid.num_voxels)
     if pad:
         grid, field = _pad_with_sign_single(grid, field, band, band_width)
     phi = reinitialize_sdf_single(grid, field, band, smooth, order, smoothing, redistance_iters)

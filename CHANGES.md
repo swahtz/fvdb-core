@@ -14,6 +14,10 @@ fVDB Version History
   neighbours now continue the sign of the adjacent active voxel, and `pad=True` seeds new voxels from their
   neighbours' sign instead of as exterior. `reinitialize_sdf` also now raises `ValueError` for anisotropic voxels
   instead of silently using only `voxel_size[0]`.
+  Occupancy inputs must include an explicit positive exterior layer around negative occupied voxels:
+  the active-region boundary no longer implicitly defines a surface, so rebuilding an all-negative
+  occupancy field yields an empty narrow band. Both SDF operations now require finite scalar values
+  with shape `(N,)` or `(N, 1)` and reject other shapes and NaN/Inf values with `ValueError`.
 - **Breaking:** Unified sparse convolution and transposed-convolution geometry around the componentwise Torch-phase
   relation ``fine_ijk = stride * coarse_ijk + tap_ijk - padding_before``, where
   ``padding_before = floor((kernel_size - 1) / 2)`` and each zero-based tap component satisfies

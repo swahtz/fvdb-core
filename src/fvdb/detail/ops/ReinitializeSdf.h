@@ -30,8 +30,11 @@ enum class SmoothingMode : int32_t {
 /// same per-voxel ordering as the input.
 ///
 /// @param batchHdl    Grid batch defining the sparse topology.
-/// @param field       Per-voxel signed field (a single list of scalar values, numel ==
-///                    totalVoxels). Only its sign is trusted; magnitudes are rebuilt. A voxel whose
+/// @param field       Per-voxel signed field with finite values and shape (N,) or (N, 1),
+///                    N == totalVoxels. It must represent the intended inside/outside regions and
+///                    zero crossings. Magnitudes need not be accurate distances, but affect
+///                    convergence, accuracy, and sub-voxel surface location. Invalid shapes and
+///                    NaN/Inf values raise ValueError. Leave no-data voxels inactive. A voxel whose
 ///                    value is exactly 0 has a zero frozen sign and is left at 0 by the redistance
 ///                    (no-data pass-through), though its signed neighbours see it as an interface.
 ///                    The surface is where the field changes sign between ACTIVE voxels; a grid
@@ -40,11 +43,11 @@ enum class SmoothingMode : int32_t {
 ///                    otherwise).
 /// @param band        Narrow-band half-width in voxels. The field is clamped to [-band*vx, band*vx]
 ///                    each sweep. Inactive neighbours act as a Dirichlet boundary whose value
-///                    continues the sign of the adjacent active voxel: -band*vx beside a negative
-///                    (interior) voxel, +band*vx beside a positive (exterior) one. An IndexGrid has
-///                    a single background slot, so this is how a narrow band with an inactive
-///                    interior (e.g. the output of rebuild_narrow_band) is kept solid rather than
-///                    hollow.
+///                    uses the adjacent voxel's frozen sign during redistancing and its current
+///                    sign during smoothing: -band*vx for negative, +band*vx otherwise. An
+///                    IndexGrid has a single background slot, so this is how a narrow band with an
+///                    inactive interior (e.g. the output of rebuild_narrow_band) is kept solid
+///                    rather than hollow.
 /// @param redistanceIters  Number of TVD-RK redistancing sweeps. Pass <= 0 to use the default
 ///                         max(6, round(2.5*band) + 2).
 /// @param order       TVD-RK order: 1 (forward Euler), 2 (Heun), or 3 (Shu-Osher).

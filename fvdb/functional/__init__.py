@@ -269,10 +269,10 @@ __all__ = [
     "integrate_tsdf_with_features_batch",
     "integrate_tsdf_with_features_single",
     # Signed distance fields
-    "reinitialize_sdf_batch",
-    "reinitialize_sdf_single",
     "rebuild_narrow_band_batch",
     "rebuild_narrow_band_single",
+    "reinitialize_sdf_batch",
+    "reinitialize_sdf_single",
     # Topology
     "clip_batch",
     "clip_single",

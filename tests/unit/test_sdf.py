@@ -159,6 +159,29 @@ class ReinitializeSdfTests(unittest.TestCase):
         # the deepest interior voxels still reach the band clamp
         self.assertLess(phi.min().item(), -(self.band - 1.25) * self.vx)
 
+    def test_rk_boundary_uses_frozen_sign(self):
+        """A stage sign flip must not turn an inactive face into an upwind contribution."""
+        ijk = torch.tensor(
+            [[0, 0, 0], [1, 0, 0], [0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1]],
+            device=self.device,
+            dtype=torch.int32,
+        )
+        g = fvdb.Grid.from_ijk(ijk, voxel_size=1.0, origin=0.0)
+        center = (g.ijk == 0).all(dim=1)
+        plus_x = (g.ijk == ijk[1]).all(dim=1)
+        # All inputs are within [-B, B]. Opposing faces cancel in the central gradient,
+        # giving the centre a frozen sign near +1 despite its small value of +0.1.
+        field = torch.full((g.num_voxels,), -3.0, device=self.device, dtype=torch.float64)
+        field[center] = 0.1
+        field[plus_x] = 3.0
+        for polarity in (1.0, -1.0):
+            with self.subTest(polarity=polarity):
+                phi = g.reinitialize_sdf(polarity * field, band=3, order=3, redistance_iters=1)
+                # Evaluating RK3 with the missing faces excluded from the upwind gradient
+                # gives centre stages -1.253625, -0.279841, -0.842034 for positive polarity.
+                # The live-sign boundary instead flips to -B after stage 1 and ends at -1.103265.
+                self.assertAlmostEqual(phi[center].item(), polarity * -0.842034, delta=1e-6)
+
     def test_rebuild_idempotent(self):
         """rebuild_narrow_band applied to its own (interior-pruned) output must reproduce that output."""
         field = self.analytic.clamp(-self.bw, self.bw)
@@ -215,6 +238,46 @@ class ReinitializeSdfTests(unittest.TestCase):
         for i in range(2):
             self.assertTrue(torch.equal(gb_out[i].ijk.jdata, g_flat.ijk))
             self.assertTrue(torch.allclose(phib[i].jdata, phi_flat, atol=1e-5))
+
+    def test_sdf_rejects_non_scalar_shapes(self):
+        """Validate scalar layout before flattening, including shapes whose numel happens to fit."""
+        n = self.grid.num_voxels
+        gb = fvdb.GridBatch.from_ijk(fvdb.JaggedTensor([self.grid.ijk]), voxel_sizes=self.vx, origins=0.0)
+        for shape in ((n, 3), (1, n), (n, 1, 1)):
+            field = torch.ones(shape, device=self.device)
+            # Construct directly so malformed leading dimensions also reach the op's validation.
+            batched = fvdb.JaggedTensor(field)
+            for grid, values in ((self.grid, field), (gb, batched)):
+                with self.subTest(shape=shape, batch=isinstance(grid, fvdb.GridBatch)):
+                    with self.assertRaisesRegex(ValueError, "scalar field with shape"):
+                        grid.reinitialize_sdf(values)
+                    for pad in (False, True):
+                        with self.assertRaisesRegex(ValueError, "scalar field with shape"):
+                            grid.rebuild_narrow_band(values, pad=pad)
+
+    def test_rebuild_rejects_wrong_voxel_count(self):
+        n = self.grid.num_voxels
+        gb = fvdb.GridBatch.from_ijk(fvdb.JaggedTensor([self.grid.ijk]), voxel_sizes=self.vx, origins=0.0)
+        for count in (n - 1, n + 1):
+            field = torch.ones(count, device=self.device)
+            for grid, values in ((self.grid, field), (gb, fvdb.JaggedTensor(field))):
+                with self.subTest(count=count, batch=isinstance(grid, fvdb.GridBatch)):
+                    with self.assertRaisesRegex(ValueError, "one value per voxel"):
+                        grid.rebuild_narrow_band(values)
+
+    def test_sdf_rejects_nonfinite_values(self):
+        """NaN must not be treated as new padding; neither solver accepts NaN or infinity."""
+        gb = fvdb.GridBatch.from_ijk(fvdb.JaggedTensor([self.grid.ijk]), voxel_sizes=self.vx, origins=0.0)
+        for invalid in (float("nan"), float("inf"), -float("inf")):
+            field = self.analytic.clamp(-self.bw, self.bw).clone()
+            field[0] = invalid
+            for grid, values in ((self.grid, field), (gb, gb.jagged_like(field))):
+                with self.subTest(invalid=invalid, batch=isinstance(grid, fvdb.GridBatch)):
+                    with self.assertRaisesRegex(ValueError, "finite values"):
+                        grid.reinitialize_sdf(values)
+                    for pad in (False, True):
+                        with self.assertRaisesRegex(ValueError, "finite values"):
+                            grid.rebuild_narrow_band(values, pad=pad)
 
     def test_single_sign_field_has_no_surface(self):
         """The surface is a sign change between ACTIVE voxels. An all-negative field (a raw occupancy

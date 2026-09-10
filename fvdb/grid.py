@@ -1514,7 +1514,7 @@ class Grid:
         Peng sign), then optionally de-staircases it with curvature-based smoothing.
 
         Args:
-            field (torch.Tensor): Per-voxel signed field, shape ``(num_voxels,)``.
+            field (torch.Tensor): Per-voxel signed field, shape ``(num_voxels,)`` or ``(num_voxels, 1)``.
             band (int): Narrow-band half-width in voxels (clamps the field to ``[-band*vx, band*vx]``).
             smooth (int): Number of smoothing passes (``0`` disables smoothing).
             order (int): TVD-RK order, one of ``1``, ``2``, or ``3``.
@@ -1528,17 +1528,21 @@ class Grid:
             sdf (torch.Tensor): The re-initialized SDF, shape ``(num_voxels,)``.
 
         Note:
-            * Only the **sign** of ``field`` is trusted; magnitudes are rebuilt. With ``smooth=0``
-              the input's zero crossing is preserved (to sub-voxel accuracy); smoothing moves the
-              surface to its de-staircased position and then re-redistances.
+            * ``field`` must represent the intended inside/outside regions and zero crossings. Its
+              magnitudes need not be accurate distances, but affect convergence, accuracy, and
+              sub-voxel surface location. With ``smooth=0`` redistancing aims to preserve the input
+              surface, subject to discretization error; smoothing moves it and then re-redistances.
+            * Values must be finite, with shape ``(N,)`` or ``(N, 1)``. Invalid shapes and NaN/Inf
+              values raise ``ValueError``.
             * The surface is where the field changes sign between *active* voxels; one active voxel
               of each sign across the crossing is sufficient (two or more per side gives the best
               sub-voxel accuracy). A grid whose active values are all one sign has no surface: the
               result is the constant ``-/+band*vx`` and :meth:`rebuild_narrow_band` returns an empty
               band, which is correct for e.g. a tile that lies entirely inside an object.
-            * Inactive neighbours read as ``+/-band*vx`` with the sign of the adjacent active voxel,
-              so both filled solids (interior active) and narrow bands whose interior is inactive are
-              valid inputs. Voxels with no data are best left *inactive* rather than given a value.
+            * Inactive neighbours read as ``+/-band*vx`` using the adjacent voxel's frozen sign during
+              redistancing and its current sign during smoothing. Both filled solids (interior active)
+              and narrow bands whose interior is inactive are valid inputs. Leave no-data voxels
+              *inactive* rather than assigning them NaN/Inf values.
             * Voxels whose value is exactly ``0`` have a zero frozen sign and are left at ``0`` by the
               redistance (a no-data pass-through; :meth:`ray_implicit_intersection` treats exact
               ``0`` as a gap). Their signed neighbours, however, see them as an interface and are
@@ -1570,7 +1574,7 @@ class Grid:
         (``|phi| < band*vx*0.999``).
 
         Args:
-            field (torch.Tensor): Per-voxel signed field, shape ``(num_voxels,)``.
+            field (torch.Tensor): Per-voxel signed field, shape ``(num_voxels,)`` or ``(num_voxels, 1)``.
             band (int): Narrow-band half-width in voxels.
             smooth (int): Number of smoothing passes (``0`` disables smoothing).
             order (int): TVD-RK order, one of ``1``, ``2``, or ``3``.
