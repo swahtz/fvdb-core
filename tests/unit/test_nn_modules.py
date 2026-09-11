@@ -221,6 +221,37 @@ class TestNNModules(unittest.TestCase):
         expected_grad[mask] = 1.0
         self.assertTrue(torch.equal(data.grad, expected_grad))
 
+    @expand_tests(all_device_dtype_combos)
+    def test_prune_rejects_mismatched_partitioning(self, device, dtype):
+        grid = self._make_dense_grid(device, batch_size=2, shape=(4, 4, 4))
+        features = self._make_features(grid, 3, device, dtype)
+        mask = grid.jagged_like(torch.ones(grid.total_voxels, dtype=torch.bool, device=device))
+        prune = fvnn.Prune()
+        n0, n1 = grid.num_voxels_at(0), grid.num_voxels_at(1)
+
+        # Same total row count as the grid, but split differently across the batch.
+        shifted = fvdb.JaggedTensor([features.jdata[: n0 - 1], features.jdata[n0 - 1 :]])
+        with self.assertRaisesRegex(ValueError, "same per-grid partitioning"):
+            prune(shifted, grid, mask)
+
+        shifted_mask = fvdb.JaggedTensor([mask.jdata[: n0 + 1], mask.jdata[n0 + 1 :]])
+        with self.assertRaisesRegex(ValueError, "same per-grid partitioning"):
+            prune(features, grid, shifted_mask)
+
+        # Wrong number of rows.
+        with self.assertRaisesRegex(ValueError, "rows"):
+            prune(fvdb.JaggedTensor([features.jdata[:n0], features.jdata[n0 : n0 + n1 - 1]]), grid, mask)
+
+        # Wrong number of tensors in the batch.
+        with self.assertRaisesRegex(ValueError, "grids"):
+            prune(fvdb.JaggedTensor([features.jdata]), grid, mask)
+
+    def test_prune_forward_keeps_docstring(self):
+        # The profiler decorator on fvdb.nn modules must not strip forward's docs or name.
+        self.assertEqual(fvnn.Prune.forward.__name__, "forward")
+        self.assertIsNotNone(fvnn.Prune.forward.__doc__)
+        self.assertIsNotNone(fvnn.MaxPool.forward.__doc__)
+
     # =========================================================================
     # SparseConv3d
     # =========================================================================
