@@ -153,6 +153,20 @@ findSegment(const OffsetT *__restrict__ offsets, int32_t numSegments, OffsetT i)
     return lo;
 }
 
+/// Slot-scaled offsets into the origin ([N*3]) and mask ([N*8]) arrays. The slot index is widened
+/// before the multiply; a 32-bit product overflows once the batch emits 2^28 slots, which box
+/// dilation reaches at roughly 10 M source leaves.
+template <typename IndexT>
+__device__ inline int64_t
+originIndex(IndexT slot) {
+    return int64_t(slot) * 3;
+}
+template <typename IndexT>
+__device__ inline int64_t
+maskIndex(IndexT slot) {
+    return int64_t(slot) * 8;
+}
+
 /// Per-grid node layout within the shared output buffer; mirrors TopologyBuilder::getBuffer.
 struct GridNodes {
     GridT *grid;
@@ -256,14 +270,14 @@ emitRefinedLeaves(EmissionArrays em) {
         const nanovdb::Coord srcOrigin = srcLeaf.origin();
         const nanovdb::Coord fineOrigin(
             srcOrigin[0] * 2 + 8 * bi, srcOrigin[1] * 2 + 8 * bj, srcOrigin[2] * 2 + 8 * bk);
-        em.tileKey[s]        = tileSortKey(fineOrigin);
-        em.nodeKey[s]        = nodeSortKey(fineOrigin);
-        em.origin[s * 3]     = fineOrigin[0];
-        em.origin[s * 3 + 1] = fineOrigin[1];
-        em.origin[s * 3 + 2] = fineOrigin[2];
-        const uint64_t *fw   = fineMask.words();
+        em.tileKey[s]                 = tileSortKey(fineOrigin);
+        em.nodeKey[s]                 = nodeSortKey(fineOrigin);
+        em.origin[originIndex(s)]     = fineOrigin[0];
+        em.origin[originIndex(s) + 1] = fineOrigin[1];
+        em.origin[originIndex(s) + 2] = fineOrigin[2];
+        const uint64_t *fw            = fineMask.words();
         for (int i = 0; i < 8; ++i) {
-            em.mask[s * 8 + i] = fw[i];
+            em.mask[maskIndex(s) + i] = fw[i];
         }
     }
 }
@@ -304,13 +318,13 @@ emitCoarsenedLeaves(EmissionArrays em) {
             contribution[wi + 4 * bi] = cw[wi] << (4 * bk + 32 * bj);
         }
 
-        em.tileKey[s]        = tileSortKey(dstLeafOrigin);
-        em.nodeKey[s]        = nodeSortKey(dstLeafOrigin);
-        em.origin[s * 3]     = dstLeafOrigin[0];
-        em.origin[s * 3 + 1] = dstLeafOrigin[1];
-        em.origin[s * 3 + 2] = dstLeafOrigin[2];
+        em.tileKey[s]                 = tileSortKey(dstLeafOrigin);
+        em.nodeKey[s]                 = nodeSortKey(dstLeafOrigin);
+        em.origin[originIndex(s)]     = dstLeafOrigin[0];
+        em.origin[originIndex(s) + 1] = dstLeafOrigin[1];
+        em.origin[originIndex(s) + 2] = dstLeafOrigin[2];
         for (int i = 0; i < 8; ++i) {
-            em.mask[s * 8 + i] = contribution[i];
+            em.mask[maskIndex(s) + i] = contribution[i];
         }
     }
 }
@@ -408,13 +422,13 @@ emitBoxDilatedLeaves(EmissionArrays em, nanovdb::Coord boxLo, nanovdb::Coord box
         const nanovdb::Coord srcOrigin = srcLeaf.origin();
         const nanovdb::Coord dstLeafOrigin(
             srcOrigin[0] + 8 * dbx, srcOrigin[1] + 8 * dby, srcOrigin[2] + 8 * dbz);
-        em.tileKey[s]        = tileSortKey(dstLeafOrigin);
-        em.nodeKey[s]        = nodeSortKey(dstLeafOrigin);
-        em.origin[s * 3]     = dstLeafOrigin[0];
-        em.origin[s * 3 + 1] = dstLeafOrigin[1];
-        em.origin[s * 3 + 2] = dstLeafOrigin[2];
+        em.tileKey[s]                 = tileSortKey(dstLeafOrigin);
+        em.nodeKey[s]                 = nodeSortKey(dstLeafOrigin);
+        em.origin[originIndex(s)]     = dstLeafOrigin[0];
+        em.origin[originIndex(s) + 1] = dstLeafOrigin[1];
+        em.origin[originIndex(s) + 2] = dstLeafOrigin[2];
         for (int i = 0; i < 8; ++i) {
-            em.mask[s * 8 + i] = out[i];
+            em.mask[maskIndex(s) + i] = out[i];
         }
     }
 }
@@ -456,11 +470,11 @@ gatherSorted(EmissionArrays em, const uint32_t *__restrict__ perm, SortedArrays 
         if (em.tileKey[s] == kInvalidTileKey) { // dead slot: payload is never read downstream
             continue;
         }
-        out.origin[j * 3]     = em.origin[s * 3];
-        out.origin[j * 3 + 1] = em.origin[s * 3 + 1];
-        out.origin[j * 3 + 2] = em.origin[s * 3 + 2];
+        out.origin[originIndex(j)]     = em.origin[originIndex(s)];
+        out.origin[originIndex(j) + 1] = em.origin[originIndex(s) + 1];
+        out.origin[originIndex(j) + 2] = em.origin[originIndex(s) + 2];
         for (int i = 0; i < 8; ++i) {
-            out.mask[j * 8 + i] = em.mask[s * 8 + i];
+            out.mask[maskIndex(j) + i] = em.mask[maskIndex(s) + i];
         }
     }
 }
@@ -559,9 +573,9 @@ combineDuplicateMasks(const uint64_t *__restrict__ tileKey,
         }
         const uint32_t head = leafHeadSlot[leafRank[j] - 1];
         for (int i = 0; i < 8; ++i) {
-            const uint64_t w = mask[j * 8 + i];
+            const uint64_t w = mask[maskIndex(j) + i];
             if (w) {
-                nanovdb::util::atomicOr(&mask[head * 8 + i], w);
+                nanovdb::util::atomicOr(&mask[maskIndex(head) + i], w);
             }
         }
     }
@@ -647,9 +661,9 @@ buildUpperNodes(BuildDeviceArrays a,
         const GridNodes n    = gridNodes(a, g);
         const uint32_t local = uint32_t(u) - a.upperStart[g];
         const uint32_t slot  = upperHeadSlot[u];
-        const nanovdb::Coord tileOrigin(sorted.origin[slot * 3] & ~4095,
-                                        sorted.origin[slot * 3 + 1] & ~4095,
-                                        sorted.origin[slot * 3 + 2] & ~4095);
+        const nanovdb::Coord tileOrigin(sorted.origin[originIndex(slot)] & ~4095,
+                                        sorted.origin[originIndex(slot) + 1] & ~4095,
+                                        sorted.origin[originIndex(slot) + 2] & ~4095);
         UpperT &upper = n.upper[local];
         n.root->tile(local)->setChild(tileOrigin, &upper, n.root->data());
         upper.mBBox  = nanovdb::CoordBBox();
@@ -702,13 +716,14 @@ buildLeafNodes(BuildDeviceArrays a,
         LeafT &leaf             = n.leaf[local];
         lower.mChildMask.setOnAtomic(lowerOff);
         lower.setChild(lowerOff, &leaf);
-        leaf.mBBoxMin = nanovdb::Coord(
-            sorted.origin[slot * 3], sorted.origin[slot * 3 + 1], sorted.origin[slot * 3 + 2]);
-        leaf.mFlags = uint8_t(nanovdb::GridFlags::HasBBox);
+        leaf.mBBoxMin = nanovdb::Coord(sorted.origin[originIndex(slot)],
+                                       sorted.origin[originIndex(slot) + 1],
+                                       sorted.origin[originIndex(slot) + 2]);
+        leaf.mFlags   = uint8_t(nanovdb::GridFlags::HasBBox);
 
         uint64_t *dstWords = leaf.mValueMask.words();
         for (int i = 0; i < 8; ++i) {
-            dstWords[i] = sorted.mask[slot * 8 + i];
+            dstWords[i] = sorted.mask[maskIndex(slot) + i];
         }
 
         // Per-leaf voxel count and the 9-bit encoded intra-leaf prefix sums (transcribed from

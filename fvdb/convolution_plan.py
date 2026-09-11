@@ -1223,6 +1223,16 @@ class ConvolutionPlan:
             target_grid = source_grid
         elif not _get_grid_data(source_grid).is_same(_get_grid_data(target_grid)):
             return None
+        # Shared grid data makes the registration diagnostic exact only for a finite transform.
+        # The general path rejects non-finite origins and zero voxel sizes through a non-finite
+        # registration offset, so the fast path must reject them too.
+        grid_data = _get_grid_data(source_grid)
+        if not bool(
+            torch.isfinite(grid_data.origins).all()
+            and torch.isfinite(grid_data.voxel_sizes).all()
+            and (grid_data.voxel_sizes != 0).all()
+        ):
+            raise ValueError("Convolution grid transform must have finite origins and finite, nonzero voxel sizes.")
         # Preserve the general path's construction-time channel-pair validation.
         for channel_pair in channel_pairs:
             if len(channel_pair) != 2 or channel_pair[0] <= 0 or channel_pair[1] <= 0:

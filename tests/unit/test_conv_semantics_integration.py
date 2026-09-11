@@ -552,8 +552,7 @@ class TestConvSemanticsIntegration(unittest.TestCase):
     def test_generated_transpose_uses_inactive_split_cuda_cache(self) -> None:
         if not torch.cuda.is_available():
             self.skipTest("CUDA is unavailable")
-        script = textwrap.dedent(
-            """
+        script = textwrap.dedent("""
             import gc
 
             import torch
@@ -624,8 +623,7 @@ class TestConvSemanticsIntegration(unittest.TestCase):
                 "split cache reused: "
                 f"inactive_split={inactive_split_bytes}, old_safe={old_safe_bytes}, request={staging_bytes}"
             )
-            """
-        )
+            """)
         completed = subprocess.run(
             [sys.executable, "-c", script],
             cwd=Path(__file__).resolve().parents[1],
@@ -971,6 +969,19 @@ class TestConvSemanticsIntegration(unittest.TestCase):
         assert plan.target_grid_batch.data.is_same(source.data)
         assert isinstance(plan._backend, _MatmulBackend)
         assert plan.topology_policy is ConvolutionTopologyPolicy.COMPLETE
+
+    @parameterized.expand([("forward",), ("transposed",)])
+    def test_identity_fast_path_rejects_non_finite_transform(self, direction) -> None:
+        # The identity short circuit skips the registration diagnostic; it must still reject the
+        # non-finite transforms the general path rejects.
+        source = _grid([(0, 0, 0), (1, 0, 0)], origins=(float("inf"), 0.0, 0.0))
+        factory = (
+            ConvolutionPlan.from_grid_batch if direction == "forward" else ConvolutionPlan.from_grid_batch_transposed
+        )
+        with pytest.raises(ValueError, match="finite"):
+            factory(kernel_size=1, stride=1, source_grid=source, target_grid=source)
+        with pytest.raises(ValueError, match="finite"):
+            factory(kernel_size=1, stride=1, source_grid=source)
 
     @parameterized.expand([("compact",), ("public",)])
     def test_matmul_accepts_2d_and_public_5d_weights_for_flat_and_jagged_data(self, weight_layout) -> None:
