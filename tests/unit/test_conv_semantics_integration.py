@@ -11,11 +11,25 @@ import warnings
 from pathlib import Path
 from unittest.mock import patch
 
+import fvdb.convolution_plan as convolution_plan_module
 import pytest
 import torch
+from fvdb.convolution_plan import (
+    _GatherScatterBackend,
+    _MatmulBackend,
+    _PredGatherIGemmBackend,
+)
+from fvdb.utils.tests.convolution_semantics_oracle import (
+    ConvolutionRelation,
+    dense_forward_oracle,
+    dense_transpose_oracle,
+    forward_degrees,
+    forward_support,
+    relation_edges,
+    transpose_support,
+)
 from parameterized import parameterized
 
-import fvdb.convolution_plan as convolution_plan_module
 from fvdb import (
     ConvolutionCoverageWarning,
     ConvolutionPhasePolicy,
@@ -26,16 +40,6 @@ from fvdb import (
     GridBatch,
     JaggedTensor,
     _fvdb_cpp,
-)
-from fvdb.convolution_plan import _GatherScatterBackend, _MatmulBackend, _PredGatherIGemmBackend
-from fvdb.utils.tests.convolution_semantics_oracle import (
-    ConvolutionRelation,
-    dense_forward_oracle,
-    dense_transpose_oracle,
-    forward_degrees,
-    forward_support,
-    relation_edges,
-    transpose_support,
 )
 
 
@@ -552,7 +556,8 @@ class TestConvSemanticsIntegration(unittest.TestCase):
     def test_generated_transpose_uses_inactive_split_cuda_cache(self) -> None:
         if not torch.cuda.is_available():
             self.skipTest("CUDA is unavailable")
-        script = textwrap.dedent("""
+        script = textwrap.dedent(
+            """
             import gc
 
             import torch
@@ -623,7 +628,8 @@ class TestConvSemanticsIntegration(unittest.TestCase):
                 "split cache reused: "
                 f"inactive_split={inactive_split_bytes}, old_safe={old_safe_bytes}, request={staging_bytes}"
             )
-            """)
+            """
+        )
         completed = subprocess.run(
             [sys.executable, "-c", script],
             cwd=Path(__file__).resolve().parents[1],
