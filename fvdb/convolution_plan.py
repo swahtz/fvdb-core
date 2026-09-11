@@ -1209,6 +1209,11 @@ class ConvolutionPlan:
         satisfied when source and target share their GridBatchData. Returns None when the fast
         path does not apply (the caller then follows the general path, keeping full validation
         for distinct-but-equal-looking grids and incompatible transforms).
+
+        Applies to ``backend="default"`` and ``backend="gather_scatter"`` alike. An explicit
+        ``gather_scatter`` request at the identity is honoured as matmul, matching the contract
+        ``_build_backend`` has always applied on the general path. With no reduction over kernel
+        taps the two backends compute the same per-voxel matmul, so the result is identical.
         """
         if kernel_size.tolist() != [1, 1, 1] or stride.tolist() != [1, 1, 1]:
             return None

@@ -248,6 +248,7 @@ emitRefinedLeaves(EmissionArrays em) {
         }
         if (!occupied) {
             em.tileKey[s] = kInvalidTileKey;
+            em.nodeKey[s] = 0; // sort pass 1 reads every slot's node key
             continue;
         }
         RefineOp::refineMask(fineMask);
@@ -281,6 +282,7 @@ emitCoarsenedLeaves(EmissionArrays em) {
         const LeafT &srcLeaf = em.srcGrids[g]->tree().template getFirstNode<0>()[leafLocal];
         if (srcLeaf.valueMask().isOff()) { // leaves always have active voxels; defensive
             em.tileKey[s] = kInvalidTileKey;
+            em.nodeKey[s] = 0;             // sort pass 1 reads every slot's node key
             continue;
         }
 
@@ -399,6 +401,7 @@ emitBoxDilatedLeaves(EmissionArrays em, nanovdb::Coord boxLo, nanovdb::Coord box
         }
         if (!occupied) {
             em.tileKey[s] = kInvalidTileKey;
+            em.nodeKey[s] = 0; // sort pass 1 reads every slot's node key
             continue;
         }
 
@@ -448,8 +451,11 @@ static __global__ void
 gatherSorted(EmissionArrays em, const uint32_t *__restrict__ perm, SortedArrays out) {
     for (int32_t j = blockIdx.x * blockDim.x + threadIdx.x; j < em.numSlots;
          j += gridDim.x * blockDim.x) {
-        const uint32_t s      = perm[j];
-        out.nodeKey[j]        = em.nodeKey[s];
+        const uint32_t s = perm[j];
+        out.nodeKey[j]   = em.nodeKey[s];
+        if (em.tileKey[s] == kInvalidTileKey) { // dead slot: payload is never read downstream
+            continue;
+        }
         out.origin[j * 3]     = em.origin[s * 3];
         out.origin[j * 3 + 1] = em.origin[s * 3 + 1];
         out.origin[j * 3 + 2] = em.origin[s * 3 + 2];
@@ -538,7 +544,8 @@ scatterNodeTables(const uint32_t *__restrict__ leafFlag,
     }
 }
 
-/// Coarsen only: OR every duplicate slot's mask contribution into its unique leaf's head slot.
+/// Coarsen and BoxDilate: OR every duplicate slot's mask contribution into its unique leaf's head
+/// slot. Refine is excluded because its source-to-output leaf mapping is injective.
 static __global__ void
 combineDuplicateMasks(const uint64_t *__restrict__ tileKey,
                       const uint32_t *__restrict__ leafFlag,

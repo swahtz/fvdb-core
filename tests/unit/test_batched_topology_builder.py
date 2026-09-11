@@ -165,7 +165,7 @@ class TestBatchedTopologyBuilder(unittest.TestCase):
                 f"conv_transpose_grid k2s2 member {b}",
             )
 
-    @parameterized.expand([("mixed_sizes",), ("empty_members",), ("tile_boundaries",)])
+    @parameterized.expand([(name,) for name in _tricky_batches().keys()])
     def test_conv_stride1_and_k3s2_match_cpu(self, name):
         # Stride-1 uniform K routes through batched box-dilate passes (odd K: [-1,1]^3 per pass;
         # even K: one-sided {-1,0}^3 / {0,1}^3 passes), and k3s2 transpose through refine + one
