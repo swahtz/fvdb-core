@@ -22,11 +22,12 @@ constexpr int INVALID_SIGN = 10;
 //
 // Both NaN and *exactly* zero map to INVALID_SIGN, i.e. they are treated as gaps that neither seed
 // the sign reference nor trigger a crossing. NaN is an explicit gap marker. Exact zero is the
-// background/no-data fill of a sparse narrow band: ops like `reinitialize_sdf` leave every active
-// voxel outside the reinitialised band at 0, so a ray that starts far from the surface walks a long
-// prefix of active-but-uncomputed 0 voxels before reaching real signed data. Mapping 0 to a real
-// sign (the mathematical `sgn(0) == 0`) would let that background seed a bogus reference and report
-// a spurious crossing the instant the ray touched the first genuine +/- voxel (issue #692). A true
+// background/no-data fill of a sparse narrow band: `reinitialize_sdf` gives an exactly-0 input
+// voxel a zero frozen sign and leaves it at 0 (e.g. the unobserved fill from integrate_tsdf), so a
+// ray that starts far from the surface walks a long prefix of active-but-no-data 0 voxels before
+// reaching real signed data. Mapping 0 to a real sign (the mathematical `sgn(0) == 0`) would let
+// that background seed a bogus reference and report a spurious crossing the instant the ray touched
+// the first genuine +/- voxel (issue #692). A true
 // on-surface voxel is still bracketed by its signed neighbours, so this only costs bracket-entry
 // (rather than interpolated) precision on the vanishingly rare exactly-0 sample.
 template <typename T>

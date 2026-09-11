@@ -1514,23 +1514,48 @@ class Grid:
         Peng sign), then optionally de-staircases it with curvature-based smoothing.
 
         Args:
-            field (torch.Tensor): Per-voxel signed field, shape ``(num_voxels,)``.
+            field (torch.Tensor): Per-voxel signed field, shape ``(num_voxels,)`` or ``(num_voxels, 1)``.
             band (int): Narrow-band half-width in voxels (clamps the field to ``[-band*vx, band*vx]``).
             smooth (int): Number of smoothing passes (``0`` disables smoothing).
             order (int): TVD-RK order, one of ``1``, ``2``, or ``3``.
             smoothing (SmoothingMode): Which Laplacian flow each smoothing pass applies --
                 :attr:`~fvdb.SmoothingMode.MEAN_CURVATURE` (default) or
                 :attr:`~fvdb.SmoothingMode.TAUBIN` (volume-preserving). Only used when ``smooth > 0``.
-            redistance_iters (int): Number of redistancing sweeps; ``<= 0`` uses the default.
+            redistance_iters (int): Number of redistancing sweeps; ``<= 0`` uses the default
+                ``max(6, round(2.5*band) + 2)``.
 
         Returns:
             sdf (torch.Tensor): The re-initialized SDF, shape ``(num_voxels,)``.
+
+        Note:
+            * ``field`` must represent the intended inside/outside regions and zero crossings. Its
+              magnitudes need not be accurate distances, but affect convergence, accuracy, and
+              sub-voxel surface location. With ``smooth=0`` redistancing aims to preserve the input
+              surface, subject to discretization error; smoothing moves it and then re-redistances.
+            * Values must be finite, with shape ``(N,)`` or ``(N, 1)``. Invalid shapes and NaN/Inf
+              values raise ``ValueError``.
+            * The surface is where the field changes sign between *active* voxels; one active voxel
+              of each sign across the crossing is sufficient (two or more per side gives the best
+              sub-voxel accuracy). A grid whose active values are all one sign has no surface: the
+              result is the constant ``-/+band*vx`` and :meth:`rebuild_narrow_band` returns an empty
+              band, which is correct for e.g. a tile that lies entirely inside an object.
+            * Inactive neighbours read as ``+/-band*vx`` using the adjacent voxel's frozen sign during
+              redistancing and its current sign during smoothing. Both filled solids (interior active)
+              and narrow bands whose interior is inactive are valid inputs. Leave no-data voxels
+              *inactive* rather than assigning them NaN/Inf values.
+            * Voxels whose value is exactly ``0`` have a zero frozen sign and are left at ``0`` by the
+              redistance (a no-data pass-through; :meth:`ray_implicit_intersection` treats exact
+              ``0`` as a gap). Their signed neighbours, however, see them as an interface and are
+              redistanced toward them, and smoothing blends them -- prune such voxels first when you
+              can.
+            * Voxels must be isotropic (``ValueError`` otherwise). CUDA only; ``float32`` or
+              ``float64``.
         """
         from . import functional
 
         return functional.reinitialize_sdf_single(self, field, band, smooth, order, smoothing, redistance_iters)
 
-    def retopologize_sdf(
+    def rebuild_narrow_band(
         self,
         field: torch.Tensor,
         band: int = 3,
@@ -1541,7 +1566,7 @@ class Grid:
         pad: bool = True,
         prune: bool = True,
     ) -> tuple[Grid, torch.Tensor]:
-        """Retopologize a signed field into a clean narrow-band SDF on a (possibly pruned) grid.
+        """Rebuild a signed field into a clean narrow-band SDF on a (possibly pruned) grid.
 
         If ``pad`` is ``True`` this grid is first dilated by ``band`` voxels so the redistance has
         room to build a full-width band, then :meth:`reinitialize_sdf` is run, and finally, if
@@ -1549,7 +1574,7 @@ class Grid:
         (``|phi| < band*vx*0.999``).
 
         Args:
-            field (torch.Tensor): Per-voxel signed field, shape ``(num_voxels,)``.
+            field (torch.Tensor): Per-voxel signed field, shape ``(num_voxels,)`` or ``(num_voxels, 1)``.
             band (int): Narrow-band half-width in voxels.
             smooth (int): Number of smoothing passes (``0`` disables smoothing).
             order (int): TVD-RK order, one of ``1``, ``2``, or ``3``.
@@ -1558,18 +1583,24 @@ class Grid:
                 :attr:`~fvdb.SmoothingMode.TAUBIN` (volume-preserving). Only used when ``smooth > 0``.
             redistance_iters (int): Number of redistancing sweeps; ``<= 0`` uses the default.
             pad (bool): If ``True`` (default) dilate by ``band`` first so the output band is a full
-                ``band`` voxels wide even if the input grid was thinner. New voxels are seeded as
-                exterior (``+band*vx``), which is correct when the interior (``phi < 0``) is already
-                represented; for a hollow thin shell, pass ``pad=False`` with a pre-banded grid.
+                ``band`` voxels wide even if the input grid was thinner. The dilation grows one layer
+                at a time and seeds each new voxel with ``+/-band*vx`` according to the sign of its
+                existing neighbours, so it continues the band inward (interior) as well as outward and
+                works for filled solids and for narrow bands whose interior is inactive.
             prune (bool): If ``True`` prune to the narrow band, else return the (padded) grid.
 
         Returns:
             out_grid (Grid): The pruned (or padded/original) grid.
             sdf (torch.Tensor): The narrow-band SDF, aligned with ``out_grid``.
+
+        Note:
+            Applying this to its own output reproduces it (up to a voxel layer at the band edge).
+            See :meth:`reinitialize_sdf` for the input contract (sign trusted, inactive neighbours
+            continue the adjacent sign, exact-``0`` voxels are no-data pass-through).
         """
         from . import functional
 
-        return functional.retopologize_sdf_single(
+        return functional.rebuild_narrow_band_single(
             self, field, band, smooth, order, smoothing, redistance_iters, pad, prune
         )
 
