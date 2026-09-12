@@ -72,12 +72,14 @@ using LeafT  = nanovdb::NanoLeaf<BuildT>;
 /// One batched topology pass over the whole batch. `Refine` and `Coarsen` are the factor-2
 /// subdivision / coarsening passes; `BoxDilate` is a Minkowski sum with the axis-aligned box
 /// [boxLo, boxHi] (components in {-1,0,1}), covering NanoVDB's 26-neighbor DilateGrid
-/// (boxLo=-1, boxHi=1) and fvdb's one-sided PadGrid octants ({-1,0}^3 and {0,1}^3). Larger
-/// boxes compose from multiple passes (Minkowski sums by boxes compose).
+/// (boxLo=-1, boxHi=1) and fvdb's one-sided PadGrid octants ({-1,0}^3 and {0,1}^3). `Erode` is
+/// the Minkowski dual with the same box: a voxel survives iff every box offset of it is active
+/// (fvdb's exclude_border padding). Larger boxes compose from multiple passes (Minkowski sums
+/// and erosions by boxes compose).
 struct TopologyPassSpec {
-    enum class Op { Refine, Coarsen, BoxDilate };
+    enum class Op { Refine, Coarsen, BoxDilate, Erode };
     Op op;
-    nanovdb::Coord boxLo{0}, boxHi{0}; // BoxDilate only
+    nanovdb::Coord boxLo{0}, boxHi{0}; // BoxDilate / Erode only
 
     static TopologyPassSpec
     refine() {
@@ -90,6 +92,10 @@ struct TopologyPassSpec {
     static TopologyPassSpec
     boxDilate(const nanovdb::Coord &lo, const nanovdb::Coord &hi) {
         return {Op::BoxDilate, lo, hi};
+    }
+    static TopologyPassSpec
+    erode(const nanovdb::Coord &lo, const nanovdb::Coord &hi) {
+        return {Op::Erode, lo, hi};
     }
 };
 
@@ -433,6 +439,135 @@ emitBoxDilatedLeaves(EmissionArrays em, nanovdb::Coord boxLo, nanovdb::Coord box
     }
 }
 
+/// Erode: slot = source leaf. out(v) = AND_{o in [boxLo,boxHi]} src(v + o), the Minkowski dual
+/// of BoxDilate. The result is a subset of the source leaf, so the source-to-output mapping is
+/// injective (no deduplication); leaves eroded to nothing become dead slots, and members eroded to
+/// nothing become empty grids downstream.
+///
+/// The AND factorizes per axis, so the mask is eroded along z, then y, then x. At a leaf border a
+/// shift pulls the voxel just outside the leaf from the neighbor leaf on that side (a missing
+/// neighbor leaf contributes zeros and so erodes the border voxels away). Because the y-stage reads
+/// the z-eroded words of the +-y neighbor leaves, and the x-stage the (z,y)-eroded words of the
+/// +-x neighbor leaves, the earlier stages run on every neighbor leaf the box reaches: up to 2^3
+/// leaves for a one-sided octant, 3^3 for the full box. Neighbors are fetched through the source
+/// grid's root (tree traversal from the root tile).
+static __global__ void
+emitErodedLeaves(EmissionArrays em, nanovdb::Coord boxLo, nanovdb::Coord boxHi) {
+    // Per-axis neighbor-leaf offset ranges reached by the box.
+    int dbLo[3], dbHi[3];
+    for (int a = 0; a < 3; ++a) {
+        dbLo[a] = boxLo[a] < 0 ? -1 : 0;
+        dbHi[a] = boxHi[a] > 0 ? 1 : 0;
+    }
+
+    for (int32_t s = blockIdx.x * blockDim.x + threadIdx.x; s < em.numSlots;
+         s += gridDim.x * blockDim.x) {
+        const int32_t g         = findSegment(em.segOffsets, em.numSegments, s);
+        const int32_t leafLocal = s - em.segOffsets[g];
+
+        const GridT *grid              = em.srcGrids[g];
+        const LeafT &srcLeaf           = grid->tree().template getFirstNode<0>()[leafLocal];
+        const nanovdb::Coord srcOrigin = srcLeaf.origin();
+
+        // Source words of the neighbor leaves the box reaches, indexed [dbx+1][dby+1][dbz+1];
+        // entries outside the box's ranges are never read.
+        uint64_t nb[3][3][3][8];
+        for (int dbx = dbLo[0]; dbx <= dbHi[0]; ++dbx) {
+            for (int dby = dbLo[1]; dby <= dbHi[1]; ++dby) {
+                for (int dbz = dbLo[2]; dbz <= dbHi[2]; ++dbz) {
+                    const uint64_t *words = nullptr;
+                    if (dbx == 0 && dby == 0 && dbz == 0) {
+                        words = srcLeaf.valueMask().words();
+                    } else if (const LeafT *nbr = grid->tree().root().probeLeaf(
+                                   srcOrigin.offsetBy(8 * dbx, 8 * dby, 8 * dbz))) {
+                        words = nbr->valueMask().words();
+                    }
+                    uint64_t *dst = nb[dbx + 1][dby + 1][dbz + 1];
+                    for (int i = 0; i < 8; ++i) {
+                        dst[i] = words ? words[i] : uint64_t(0);
+                    }
+                }
+            }
+        }
+
+        // z-stage on every (dbx, dby) block: bit z of the result is AND over oz of bit z+oz, taken
+        // from the +-z neighbor block when z+oz leaves [0,7].
+        uint64_t wz[3][3][8];
+        for (int dbx = dbLo[0]; dbx <= dbHi[0]; ++dbx) {
+            for (int dby = dbLo[1]; dby <= dbHi[1]; ++dby) {
+                const uint64_t(*blk)[8] = nb[dbx + 1][dby + 1];
+                for (int i = 0; i < 8; ++i) {
+                    uint64_t acc = ~uint64_t(0);
+                    for (int oz = boxLo[2]; oz <= boxHi[2]; ++oz) {
+                        uint64_t v = shiftWordZ(blk[1][i], -oz);
+                        if (oz > 0) {
+                            v |= shiftWordZ(blk[2][i], 8 - oz);
+                        } else if (oz < 0) {
+                            v |= shiftWordZ(blk[0][i], -8 - oz);
+                        }
+                        acc &= v;
+                    }
+                    wz[dbx + 1][dby + 1][i] = acc;
+                }
+            }
+        }
+
+        // y-stage on every dbx block: byte y of the result is AND over oy of byte y+oy, from the
+        // +-y neighbor block when y+oy leaves [0,7].
+        uint64_t wy[3][8];
+        for (int dbx = dbLo[0]; dbx <= dbHi[0]; ++dbx) {
+            const uint64_t(*blk)[8] = wz[dbx + 1];
+            for (int i = 0; i < 8; ++i) {
+                uint64_t acc = ~uint64_t(0);
+                for (int oy = boxLo[1]; oy <= boxHi[1]; ++oy) {
+                    uint64_t v = shiftWordY(blk[1][i], -oy);
+                    if (oy > 0) {
+                        v |= shiftWordY(blk[2][i], 8 - oy);
+                    } else if (oy < 0) {
+                        v |= shiftWordY(blk[0][i], -8 - oy);
+                    }
+                    acc &= v;
+                }
+                wy[dbx + 1][i] = acc;
+            }
+        }
+
+        // x-stage (word permutation): word x of the result is AND over ox of word x+ox, from the
+        // +-x neighbor block when x+ox leaves [0,7].
+        uint64_t out[8];
+        uint64_t occupied = 0;
+        for (int x = 0; x < 8; ++x) {
+            uint64_t acc = ~uint64_t(0);
+            for (int ox = boxLo[0]; ox <= boxHi[0]; ++ox) {
+                const int xs = x + ox;
+                if (xs < 0) {
+                    acc &= wy[0][7];
+                } else if (xs > 7) {
+                    acc &= wy[2][0];
+                } else {
+                    acc &= wy[1][xs];
+                }
+            }
+            out[x] = acc;
+            occupied |= acc;
+        }
+        if (!occupied) {
+            em.tileKey[s] = kInvalidTileKey;
+            em.nodeKey[s] = 0; // sort pass 1 reads every slot's node key
+            continue;
+        }
+
+        em.tileKey[s]                 = tileSortKey(srcOrigin);
+        em.nodeKey[s]                 = nodeSortKey(srcOrigin);
+        em.origin[originIndex(s)]     = srcOrigin[0];
+        em.origin[originIndex(s) + 1] = srcOrigin[1];
+        em.origin[originIndex(s) + 2] = srcOrigin[2];
+        for (int i = 0; i < 8; ++i) {
+            em.mask[maskIndex(s) + i] = out[i];
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Sort / dedup kernels
 // ---------------------------------------------------------------------------------------------
@@ -559,7 +694,7 @@ scatterNodeTables(const uint32_t *__restrict__ leafFlag,
 }
 
 /// Coarsen and BoxDilate: OR every duplicate slot's mask contribution into its unique leaf's head
-/// slot. Refine is excluded because its source-to-output leaf mapping is injective.
+/// slot. Refine and Erode are excluded because their source-to-output leaf mappings are injective.
 static __global__ void
 combineDuplicateMasks(const uint64_t *__restrict__ tileKey,
                       const uint32_t *__restrict__ leafFlag,
@@ -870,6 +1005,14 @@ runBatchedTopologyPass(const BatchedTopologySource &src,
             fanout *= (pass.boxHi[a] > 0 ? 1 : 0) - (pass.boxLo[a] < 0 ? -1 : 0) + 1;
         }
         break;
+    case TopologyPassSpec::Op::Erode:
+        for (int a = 0; a < 3; ++a) {
+            TORCH_CHECK(pass.boxLo[a] >= -1 && pass.boxLo[a] <= 0 && pass.boxHi[a] >= 0 &&
+                            pass.boxHi[a] <= 1,
+                        "Erode pass components must be in {-1,0} / {0,1}");
+        }
+        fanout = 1; // the eroded leaf is a subset of the source leaf
+        break;
     }
 
     // Per-grid emission slot ranges (host-known: leaf counts x fanout; no sync needed).
@@ -951,6 +1094,10 @@ runBatchedTopologyPass(const BatchedTopologySource &src,
             break;
         case TopologyPassSpec::Op::BoxDilate:
             emitBoxDilatedLeaves<<<numBlocks(numSlots), kThreads, 0, stream>>>(
+                em, pass.boxLo, pass.boxHi);
+            break;
+        case TopologyPassSpec::Op::Erode:
+            emitErodedLeaves<<<numBlocks(numSlots), kThreads, 0, stream>>>(
                 em, pass.boxLo, pass.boxHi);
             break;
         }
@@ -1069,7 +1216,9 @@ runBatchedTopologyPass(const BatchedTopologySource &src,
                                                                         u32(upperHeadSlot));
         C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-        if (pass.op != TopologyPassSpec::Op::Refine) { // coarsen/dilate have duplicate producers
+        const bool injective =
+            pass.op == TopologyPassSpec::Op::Refine || pass.op == TopologyPassSpec::Op::Erode;
+        if (!injective) { // coarsen/dilate have duplicate producers
             combineDuplicateMasks<<<numBlocks(numSlots), kThreads, 0, stream>>>(sorted.tileKey,
                                                                                 u32(leafFlag),
                                                                                 u32(leafRank),

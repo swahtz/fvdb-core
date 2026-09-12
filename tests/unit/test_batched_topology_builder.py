@@ -4,9 +4,10 @@
 """Equivalence tests for the batched leaf-mask topology builder (issue #755).
 
 On CUDA, ``refined_grid`` / ``coarsened_grid`` (and through them ``conv_grid`` /
-``conv_transpose_grid`` for K == S), and the positive-padding ops ``dual_grid`` /
-``build_padded_grid(0, k)`` (issue #775), build all batch members in a single batched pass instead
-of one NanoVDB build + merge per member. These tests pin the batched results against:
+``conv_transpose_grid`` for K == S), and the padding ops ``dual_grid`` / ``build_padded_grid``
+(box dilation for plain padding, erosion for ``exclude_border``; issue #775), build all batch
+members in a single batched pass instead of one NanoVDB build + merge per member. These tests pin
+the batched results against:
 
 - ``from_ijk`` (PointsToGrid) grids built from independently computed expected coordinates,
   compared **elementwise** (``torch.equal`` on ``ijk.jdata``), which pins the canonical NanoVDB
@@ -53,19 +54,45 @@ def _expected_coarsen_ijk(ijk: torch.Tensor, factor: int) -> torch.Tensor:
     return torch.unique(coarse, dim=0).to(torch.int32)
 
 
-def _expected_pad_ijk(ijk: torch.Tensor, bmax: int) -> torch.Tensor:
-    """Unique coordinates of the Minkowski sum of ``ijk`` with the box {0, ..., bmax}^3.
+def _box_offsets(bmin: int, bmax: int) -> torch.Tensor:
+    r = torch.arange(bmin, bmax + 1)
+    return torch.stack(torch.meshgrid(r, r, r, indexing="ij"), dim=-1).reshape(-1, 3)
 
-    ``bmax`` chained unit pads by the octant {0,1}^3 compose to exactly this box (Minkowski sums
-    of axis-aligned boxes compose), so this is the expected result of ``build_padded_grid(0, bmax)``
-    and, for ``bmax == 1``, of ``dual_grid()``.
+
+def _expected_pad_ijk(ijk: torch.Tensor, bmax: int, bmin: int = 0) -> torch.Tensor:
+    """Unique coordinates of the Minkowski sum of ``ijk`` with the box {bmin, ..., bmax}^3.
+
+    ``bmax`` chained unit pads by the octant {0,1}^3 and ``-bmin`` by {-1,0}^3 compose to exactly
+    this box (Minkowski sums of axis-aligned boxes compose), so this is the expected result of
+    ``build_padded_grid(bmin, bmax)`` and, for ``(0, 1)``, of ``dual_grid()``.
     """
     if ijk.numel() == 0:
         return ijk.reshape(0, 3)
-    r = torch.arange(bmax + 1)
-    offsets = torch.stack(torch.meshgrid(r, r, r, indexing="ij"), dim=-1).reshape(-1, 3)
+    offsets = _box_offsets(bmin, bmax)
     padded = ijk.to(torch.int64)[:, None, :] + offsets[None, :, :].to(ijk.device)
     return torch.unique(padded.reshape(-1, 3), dim=0).to(torch.int32)
+
+
+def _coord_keys(ijk: torch.Tensor) -> torch.Tensor:
+    """Injective int64 key per coordinate (components must lie within +-2^20)."""
+    shifted = ijk.to(torch.int64) + (1 << 20)
+    return (shifted[:, 0] << 42) | (shifted[:, 1] << 21) | shifted[:, 2]
+
+
+def _expected_erode_ijk(ijk: torch.Tensor, bmin: int, bmax: int) -> torch.Tensor:
+    """Voxels of ``ijk`` whose whole {bmin, ..., bmax}^3 neighborhood lies in ``ijk``.
+
+    Erosion by the box, i.e. the ``exclude_border=True`` semantics of ``build_padded_grid`` /
+    ``dual_grid``: a voxel survives iff every box offset of it is active. Chained unit erosions by
+    the octants compose to this box like the Minkowski sums do.
+    """
+    if ijk.numel() == 0:
+        return ijk.reshape(0, 3)
+    voxels = torch.unique(ijk.to(torch.int64), dim=0)
+    offsets = _box_offsets(bmin, bmax).to(ijk.device)
+    neighbors = (voxels[:, None, :] + offsets[None, :, :]).reshape(-1, 3)
+    present = torch.isin(_coord_keys(neighbors), _coord_keys(voxels)).reshape(voxels.shape[0], -1)
+    return voxels[present.all(dim=1)].to(torch.int32)
 
 
 def _build_padded_grid(grid: GridBatch, bmin: int, bmax: int, exclude_border: bool = False) -> GridBatch:
@@ -122,6 +149,45 @@ def _tricky_batches():
         ],
         "larger_batch": [torch.randint(-32, 32, (50 + 37 * i, 3), dtype=torch.int32) for i in range(16)],
     }
+
+
+# Dense coordinate batches for the erosion tests: the sparse random members of _tricky_batches()
+# mostly erode to nothing, so these add members dense enough that interior voxels survive, with
+# leaves straddling leaf (multiples of 8) and root-tile (+-4096) boundaries and negative octants.
+def _dense_batches():
+    torch.manual_seed(7)
+    return {
+        "dense_blobs": [
+            torch.randint(-6, 10, (12000, 3), dtype=torch.int32),
+            torch.empty((0, 3), dtype=torch.int32),
+            torch.randint(4090, 4102, (6000, 3), dtype=torch.int32),
+            torch.randint(-4102, -4090, (6000, 3), dtype=torch.int32),
+        ],
+        "dense_slabs": [
+            # Thin slabs: everything erodes away along the thin axis unless the box is one-sided.
+            torch.stack(
+                torch.meshgrid(torch.arange(-4, 12), torch.arange(-4, 12), torch.arange(0, 2), indexing="ij"), -1
+            )
+            .reshape(-1, 3)
+            .to(torch.int32),
+            torch.stack(torch.meshgrid(torch.arange(0, 3), torch.arange(-9, 9), torch.arange(-9, 9), indexing="ij"), -1)
+            .reshape(-1, 3)
+            .to(torch.int32),
+        ],
+    }
+
+
+def _solid_block(lo, hi):
+    """All coordinates of the half-open box [lo, hi)^3."""
+    r = torch.arange(lo, hi)
+    return torch.stack(torch.meshgrid(r, r, r, indexing="ij"), -1).reshape(-1, 3).to(torch.int32)
+
+
+def _shell(lo, hi):
+    """One-voxel-thick surface of the half-open box [lo, hi)^3."""
+    block = _solid_block(lo, hi)
+    on_surface = ((block == lo) | (block == hi - 1)).any(dim=1)
+    return block[on_surface]
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required for the batched builder")
@@ -200,6 +266,74 @@ class TestBatchedTopologyBuilder(unittest.TestCase):
             cpu_result = _build_padded_grid(cpu_grid, 0, bmax)
             self._check_against_cpu(result, cpu_result, f"{name} padded_grid(0, {bmax}) vs CPU")
             self.assertTrue(torch.allclose(result.origins, grid.origins), f"{name} padded_grid(0, {bmax}) origin")
+
+    @parameterized.expand([(name,) for name in list(_tricky_batches().keys()) + list(_dense_batches().keys())])
+    def test_dual_grid_exclude_border_matches_expected_and_cpu(self, name):
+        # dual_grid(exclude_border=True) is one batched Erode({0,1}^3) pass: a voxel survives iff
+        # its whole positive octant is active. Members eroded to nothing must come out as empty
+        # grids (no host-side emptiness check).
+        coords = {**_tricky_batches(), **_dense_batches()}[name]
+        grid = _build(coords, "cuda")
+        result = grid.dual_grid(exclude_border=True)
+        expected = [_expected_erode_ijk(c, 0, 1) for c in coords]
+        self._check_against_expected(result, expected, f"{name} dual_grid(exclude_border)")
+        cpu_result = _build(coords, "cpu").dual_grid(exclude_border=True)
+        self._check_against_cpu(result, cpu_result, f"{name} dual_grid(exclude_border) vs CPU")
+        self.assertTrue(
+            torch.allclose(result.origins, grid.origins - 0.5 * grid.voxel_sizes),
+            f"{name} dual_grid(exclude_border) origin",
+        )
+
+    @parameterized.expand([(name,) for name in list(_tricky_batches().keys()) + list(_dense_batches().keys())])
+    def test_padded_grid_negative_bounds_match_expected_and_cpu(self, name):
+        # A general [bmin, bmax] box is bmax {0,1}^3 passes followed by -bmin {-1,0}^3 passes:
+        # BoxDilate passes for plain padding (Minkowski sum), Erode passes for exclude_border.
+        coords = {**_tricky_batches(), **_dense_batches()}[name]
+        grid = _build(coords, "cuda")
+        cpu_grid = _build(coords, "cpu")
+        for bmin, bmax in ((-1, 0), (-1, 1), (-2, 0)):
+            msg = f"{name} padded_grid({bmin}, {bmax})"
+            result = _build_padded_grid(grid, bmin, bmax)
+            expected = [_expected_pad_ijk(c, bmax, bmin) for c in coords]
+            self._check_against_expected(result, expected, msg)
+            self._check_against_cpu(result, _build_padded_grid(cpu_grid, bmin, bmax), f"{msg} vs CPU")
+
+            msg = f"{name} padded_grid({bmin}, {bmax}, exclude_border)"
+            result = _build_padded_grid(grid, bmin, bmax, exclude_border=True)
+            expected = [_expected_erode_ijk(c, bmin, bmax) for c in coords]
+            self._check_against_expected(result, expected, msg)
+            cpu_result = _build_padded_grid(cpu_grid, bmin, bmax, exclude_border=True)
+            self._check_against_cpu(result, cpu_result, f"{msg} vs CPU")
+            self.assertTrue(torch.allclose(result.origins, grid.origins), f"{msg} origin")
+
+    def test_erode_shell_to_empty_and_solid_block_interior(self):
+        # A one-voxel-thick shell has no voxel with a fully active octant, so every erosion
+        # empties it (grid_count preserved, member empty inline). A solid block keeps its interior:
+        # [lo, hi)^3 eroded by {0,1}^3 is [lo, hi-1)^3, by [-1,1]^3 is [lo+1, hi-1)^3, by {-1,0}^3
+        # twice is [lo+2, hi)^3. Blocks straddle leaf (multiples of 8) and root-tile (4096)
+        # boundaries so border bits cross into neighbor leaves under different parents.
+        shells = [_shell(0, 10), _shell(-5, 11), _shell(4090, 4100)]
+        shell_grid = _build(shells, "cuda")
+        eroded = shell_grid.dual_grid(exclude_border=True)
+        self.assertEqual(eroded.grid_count, 3)
+        self.assertTrue(torch.equal(eroded.num_voxels.cpu(), torch.zeros(3, dtype=torch.int64)))
+        self.assertEqual(eroded.ijk.jdata.shape[0], 0)
+        eroded = _build_padded_grid(shell_grid, -1, 1, exclude_border=True)
+        self.assertTrue(torch.equal(eroded.num_voxels.cpu(), torch.zeros(3, dtype=torch.int64)))
+
+        bounds = [(0, 10), (-5, 11), (4090, 4100), (-4100, -4090)]
+        blocks = [_solid_block(lo, hi) for lo, hi in bounds]
+        block_grid = _build(blocks + [torch.empty((0, 3), dtype=torch.int32)], "cuda")
+        for (bmin, bmax), shrink in (((0, 1), (0, -1)), ((-1, 1), (1, -1)), ((-2, 0), (2, 0))):
+            result = _build_padded_grid(block_grid, bmin, bmax, exclude_border=True)
+            expected = [_solid_block(lo + shrink[0], hi + shrink[1]) for lo, hi in bounds]
+            expected.append(torch.empty((0, 3), dtype=torch.int32))
+            self._check_against_expected(result, expected, f"solid block erode({bmin}, {bmax})")
+            for b, (lo, hi) in enumerate(bounds):
+                bbox = result.bbox_at(b).cpu()
+                self.assertTrue(torch.equal(bbox[0], torch.full((3,), lo + shrink[0], dtype=bbox.dtype)))
+                self.assertTrue(torch.equal(bbox[1], torch.full((3,), hi + shrink[1] - 1, dtype=bbox.dtype)))
+            self.assertEqual(int(result.num_voxels[-1].item()), 0)
 
     def test_dual_grid_of_sliced_batch(self):
         # A sliced (non-contiguous) view shares a handle holding more grids than batchSize(); the
