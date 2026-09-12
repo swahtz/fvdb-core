@@ -35,7 +35,7 @@ NUM_LEVELS = 4  # stride-2 pyramid depth; the decoder neck lattice is (RESOLUTIO
 CHANNELS = [16, 32, 64, 128, 256]  # CHANNELS[0] = full resolution, CHANNELS[NUM_LEVELS] = coarsest
 LATENT_DIM = 128
 KLD_WEIGHT = 1e-2
-NUM_ITERATIONS = 1500
+NUM_ITERATIONS = 1000
 BATCH_SIZE = 16
 LEARNING_RATE = 1e-3
 LOG_EVERY = 100
