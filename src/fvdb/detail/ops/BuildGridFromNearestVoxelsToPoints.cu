@@ -1,7 +1,6 @@
 // Copyright Contributors to the OpenVDB Project
 // SPDX-License-Identifier: Apache-2.0
 //
-#include <fvdb/BuilderResource.h>
 #include <fvdb/GridBatchData.h>
 #include <fvdb/detail/GridBatchDataFactory.h>
 #include <fvdb/detail/ops/BuildGridFromIjk.h>
@@ -10,15 +9,13 @@
 #include <fvdb/detail/utils/Utils.h>
 #include <fvdb/detail/utils/cuda/ForEachCUDA.cuh>
 #include <fvdb/detail/utils/cuda/RAIIRawDeviceBuffer.h>
-#include <fvdb/detail/utils/nanovdb/CreateEmptyGridHandle.h>
-#include <fvdb/detail/utils/nanovdb/PadGrid.cuh>
+#include <fvdb/detail/utils/nanovdb/BatchedTopologyBuilder.cuh>
 
 #include <nanovdb/tools/CreateNanoGrid.h>
-#include <nanovdb/tools/cuda/PointsToGrid.cuh>
 
-#include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAMathCompat.h>
+#include <c10/cuda/CUDAStream.h>
 #include <torch/types.h>
 
 namespace fvdb {
@@ -94,36 +91,21 @@ dispatchBuildGridFromNearestVoxelsToPoints<torch::kCUDA>(
     c10::cuda::CUDAGuard deviceGuard(points.device());
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream(points.device().index());
 
-    // Build the base grid from the single voxel containing each point. Points are unstructured, so
-    // one sort is unavoidable.
-    JaggedTensor flooredIjk                        = flooredIjkForPoints(points, txs);
-    nanovdb::GridHandle<TorchDeviceBuffer> baseHdl = ops::_createNanoGridFromIJK(flooredIjk);
+    // Build the base grid batch from the single voxel containing each point: one batched Coords
+    // pass over all members (points are unstructured, so one sort is unavoidable).
+    const JaggedTensor flooredIjk       = flooredIjkForPoints(points, txs);
+    batched::BatchedTopologyResult base = ops::batchedCoordsPassFromIJK(flooredIjk);
 
     // The 8 nearest voxels of a point are floor(p) + {0,1}^3, so the nearest-voxel grid is the base
-    // grid padded by one positive octant (the Minkowski sum distributes over the point union).
-    TorchDeviceBuffer guide(0, points.device());
-    const torch::Tensor joffsetsCpu = points.joffsets().cpu();
-    const auto joffsetsAcc          = joffsetsCpu.accessor<fvdb::JOffsetsType, 1>();
-
-    std::vector<nanovdb::GridHandle<TorchDeviceBuffer>> handles;
-    handles.reserve(baseHdl.gridCount());
-    for (uint32_t i = 0; i < baseHdl.gridCount(); i += 1) {
-        if (joffsetsAcc[i + 1] - joffsetsAcc[i] == 0) {
-            // No points in this batch item -> empty grid (>=1 point always yields >=1 base voxel).
-            handles.push_back(createEmptyGridHandle(points.device()));
-            continue;
-        }
-        nanovdb::OnIndexGrid *grid = baseHdl.deviceGrid<nanovdb::ValueOnIndex>(i);
-        TORCH_CHECK(grid, "Grid is null");
-        morphology::PadGrid<nanovdb::ValueOnIndex, BuilderResource> op(
-            grid, /*positiveOctant=*/true, stream.stream());
-        op.setChecksum(nanovdb::CheckMode::Default);
-        handles.push_back(op.getHandle(guide));
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-    }
-
-    return handles.size() == 1 ? std::move(handles[0])
-                               : nanovdb::cuda::mergeGridHandles(handles, &guide);
+    // grid padded by one positive octant (the Minkowski sum distributes over the point union). One
+    // batched BoxDilate pass over the Coords result covers every member -- no per-member PadGrid
+    // builds, handle merging, or host copy of the jagged offsets (issue #775). Members without
+    // points are empty base grids and stay empty.
+    batched::BatchedTopologyResult padded = batched::runBatchedTopologyPass(
+        batched::sourceFromResult(base, points.device()),
+        batched::TopologyPassSpec::boxDilate(nanovdb::Coord(0), nanovdb::Coord(1)),
+        stream.stream());
+    return nanovdb::GridHandle<TorchDeviceBuffer>(std::move(padded.buffer));
 }
 
 template <>

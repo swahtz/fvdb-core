@@ -165,6 +165,84 @@ def _from_ijk_batches():
     return batches
 
 
+# Point batches for from_nearest_voxels_to_points. World coordinates are chosen so that, with the
+# voxel size / origin below, the index-space coordinates cover the same tricky regimes as
+# _tricky_batches(): mixed member sizes, empty members (first/middle/last/all), coordinates
+# straddling the +-4096 root-tile boundaries with negative components (points exactly on voxel
+# boundaries included, where floor and the +1 pad land in different root tiles), single members
+# (non-empty, one point, empty), and a 16-member batch.
+_NEAREST_VOXEL_SIZE = 0.5  # power of two: p * (1 / voxel_size) is exact in float32
+_NEAREST_ORIGIN = 0.25  # origin / voxel_size = 0.5 is exact in float32
+
+
+def _nearest_voxel_point_batches():
+    torch.manual_seed(11)
+    vs = _NEAREST_VOXEL_SIZE
+    # World position of index-space value `i` (voxel boundary), so floor lands exactly on `i`.
+    world = lambda i: i * vs + _NEAREST_ORIGIN  # noqa: E731
+    return {
+        "mixed_sizes": [
+            torch.rand(2000, 3) * 8 - 4,
+            torch.tensor([[0.3, -0.7, 1.1]]),
+            torch.rand(50, 3) * 0.1 + 5.0,
+            torch.rand(3000, 3) * 40 - 20,
+        ],
+        "empty_members": [
+            torch.empty(0, 3),
+            torch.rand(500, 3) * 6 - 3,
+            torch.empty(0, 3),
+            torch.tensor([[world(5), world(5), world(5)], [world(5), world(5), world(6)]]),
+            torch.empty(0, 3),
+        ],
+        "all_empty": [torch.empty(0, 3), torch.empty(0, 3)],
+        "tile_boundaries": [
+            torch.tensor(
+                [
+                    [world(-4097), world(-4097), world(-4097)],
+                    [world(-4096), world(-4096), world(-4096)],
+                    [world(-4097) + 0.1, world(-4097) + 0.2, world(-4097) + 0.3],
+                    [world(-2049), 0.0, 0.0],
+                    [world(-1), world(-1), world(-1)],
+                    [world(-1) + 0.49, world(-1) + 0.49, world(-1) + 0.49],
+                    [0.0, 0.0, 0.0],
+                    [world(4095), world(4095), world(4095)],
+                    [world(4095) + 0.3, world(4095) + 0.3, world(4095) + 0.3],
+                    [world(4096), world(4096), world(4096)],
+                    [world(4096), world(-4097), world(0)],
+                    [world(-8193), world(0), world(-4097)],
+                ]
+            ),
+            torch.rand(600, 3) * (world(-3900) - world(-4200)) + world(-4200),
+            torch.rand(600, 3) * (world(4200) - world(3900)) + world(3900),
+            torch.cat(
+                [
+                    torch.rand(300, 3) * 20 - world(4110),
+                    torch.rand(300, 3) * 20 + world(4080),
+                ]
+            ),
+        ],
+        # Single-member batches take the PointsToGrid path of batchedCoordsPassFromIJK (wrapped by
+        # resultFromGridHandle); the pad pass then chains onto that wrapped result.
+        "single_grid": [torch.rand(1500, 3) * 16 - 8],
+        "single_point": [torch.tensor([[world(-4097) + 0.1, world(4095) + 0.4, world(-1) + 0.3]])],
+        "single_empty": [torch.empty(0, 3)],
+        "larger_batch": [torch.rand(50 + 137 * i, 3) * 32 - 16 for i in range(16)],
+    }
+
+
+def _expected_nearest_voxels_ijk(points: torch.Tensor, voxel_size: float, origin: float) -> torch.Tensor:
+    """Unique floor(transform(p)) + {0,1}^3 -- the 8 voxels nearest to each point -- computed like
+    the op's VoxelCoordTransform (p * (1 / voxel_size) + (-origin / voxel_size), then floor)."""
+    if points.numel() == 0:
+        return torch.empty((0, 3), dtype=torch.int32)
+    scale = torch.tensor(1.0 / voxel_size, dtype=torch.float32)
+    translate = torch.tensor(-origin / voxel_size, dtype=torch.float32)
+    ijk0 = torch.floor(points.to(torch.float32) * scale + translate).to(torch.int64)
+    offsets = torch.stack(torch.meshgrid(*[torch.arange(2)] * 3, indexing="ij"), dim=-1).reshape(-1, 3)
+    ijk = (ijk0[:, None, :] + offsets[None, :, :]).reshape(-1, 3)
+    return torch.unique(ijk, dim=0).to(torch.int32)
+
+
 # Canonical NanoVDB voxel enumeration order (root tiles by offset-shifted sort key, then x-major
 # upper/lower child offsets, then leaf-local offset) of the hand-written members above, as produced
 # by the per-member PointsToGrid path from_ijk used before the batched Coords pass. Pins the
@@ -392,6 +470,45 @@ class TestBatchedTopologyBuilder(unittest.TestCase):
         self._check_multi_member_equals_per_member(nearest, nearest_singles, "from_nearest_voxels_to_points")
         nearest_cpu = GridBatch.from_nearest_voxels_to_points(JaggedTensor(pts), voxel_sizes=0.1, origins=0.0)
         self._check_against_cpu(nearest, nearest_cpu, "from_nearest_voxels_to_points vs CPU")
+
+    @parameterized.expand([(name,) for name in _nearest_voxel_point_batches()])
+    def test_from_nearest_voxels_to_points_matches_expected_and_cpu(self, name):
+        # CUDA: batched Coords pass (floor(p) per point) chained with one batched BoxDilate(0, +1)
+        # pass (the {0,1}^3 pad) -- no per-member PadGrid / mergeGridHandles.
+        pts = _nearest_voxel_point_batches()[name]
+        vs, og = _NEAREST_VOXEL_SIZE, _NEAREST_ORIGIN
+        result = GridBatch.from_nearest_voxels_to_points(
+            JaggedTensor([p.cuda() for p in pts]), voxel_sizes=vs, origins=og
+        )
+        expected = [_expected_nearest_voxels_ijk(p, vs, og) for p in pts]
+        for p, e in zip(pts, expected):
+            # Every point contributes exactly 8 candidates; the union has at least 8 unless empty.
+            self.assertEqual(e.shape[0] >= 8, p.shape[0] > 0, f"{name}: expected-set sanity")
+        self._check_against_expected(result, expected, f"from_nearest_voxels_to_points[{name}]")
+        singles = [
+            GridBatch.from_nearest_voxels_to_points(JaggedTensor([p.cuda()]), voxel_sizes=vs, origins=og) for p in pts
+        ]
+        self._check_multi_member_equals_per_member(result, singles, f"from_nearest_voxels_to_points[{name}]")
+        cpu = GridBatch.from_nearest_voxels_to_points(JaggedTensor(pts), voxel_sizes=vs, origins=og)
+        self._check_against_cpu(result, cpu, f"from_nearest_voxels_to_points[{name}] vs CPU")
+
+    def test_from_nearest_voxels_to_points_per_member_transforms(self):
+        # Per-member voxel sizes / origins: each member's pad must use its own transform.
+        torch.manual_seed(5)
+        pts = [torch.rand(700, 3) * 10 - 5, torch.empty(0, 3), torch.rand(300, 3) * 3]
+        sizes = [0.5, 1.0, 0.25]
+        origins = [0.0, 0.25, -0.125]
+        result = GridBatch.from_nearest_voxels_to_points(
+            JaggedTensor([p.cuda() for p in pts]),
+            voxel_sizes=[[v] * 3 for v in sizes],
+            origins=[[o] * 3 for o in origins],
+        )
+        expected = [_expected_nearest_voxels_ijk(p, v, o) for p, v, o in zip(pts, sizes, origins)]
+        self._check_against_expected(result, expected, "from_nearest_voxels_to_points per-member transforms")
+        cpu = GridBatch.from_nearest_voxels_to_points(
+            JaggedTensor(pts), voxel_sizes=[[v] * 3 for v in sizes], origins=[[o] * 3 for o in origins]
+        )
+        self._check_against_cpu(result, cpu, "from_nearest_voxels_to_points per-member transforms vs CPU")
 
     def test_from_mesh_multi_member_matches_per_member_and_cpu(self):
         try:
