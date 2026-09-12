@@ -1,13 +1,13 @@
 // Copyright Contributors to the OpenVDB Project
 // SPDX-License-Identifier: Apache-2.0
 //
-#include <fvdb/BuilderResource.h>
 #include <fvdb/GridBatchData.h>
 #include <fvdb/detail/GridBatchDataFactory.h>
 #include <fvdb/detail/ops/BuildGridFromIjk.h>
 #include <fvdb/detail/utils/AccessorHelpers.cuh>
 #include <fvdb/detail/utils/Utils.h>
 #include <fvdb/detail/utils/cuda/Utils.cuh>
+#include <fvdb/detail/utils/nanovdb/BatchedTopologyBuilder.cuh>
 #include <fvdb/detail/utils/nanovdb/CreateEmptyGridHandle.h>
 
 #if CCCL_DEVICE_MERGE_SUPPORTED
@@ -19,6 +19,7 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAMathCompat.h>
+#include <c10/cuda/CUDAStream.h>
 #include <torch/types.h>
 
 #include <limits>
@@ -31,7 +32,8 @@ template <torch::DeviceType>
 nanovdb::GridHandle<TorchDeviceBuffer> dispatchCreateNanoGridFromIJK(const JaggedTensor &ijk);
 
 // NanoVDB's PointsToGrid / DistributedPointsToGrid radix sort casts the per-grid coordinate count
-// to int32 (PointsToGrid.cuh:645), which silently corrupts the grid above 2^31 candidates. Reject
+// to int32 (PointsToGrid.cuh:645), which silently corrupts the grid above 2^31 candidates, and the
+// batched Coords pass indexes its emission slots (one per coordinate) with int32 as well. Reject
 // that here rather than return a garbage grid. Takes an already-on-host joffsets accessor so each
 // dispatch reuses the host copy it makes anyway -- no extra device sync.
 static void
@@ -52,8 +54,6 @@ checkCandidateCountsFitInt32(const torch::TensorAccessor<fvdb::JOffsetsType, 1> 
 template <>
 nanovdb::GridHandle<TorchDeviceBuffer>
 dispatchCreateNanoGridFromIJK<torch::kCUDA>(const JaggedTensor &ijk) {
-    using GridT = nanovdb::ValueOnIndex;
-
     TORCH_CHECK(ijk.is_contiguous(), "ijk must be contiguous");
     TORCH_CHECK(ijk.device().is_cuda(), "device must be cuda");
     TORCH_CHECK(ijk.device().has_index(), "device must have index");
@@ -61,20 +61,23 @@ dispatchCreateNanoGridFromIJK<torch::kCUDA>(const JaggedTensor &ijk) {
                 "ijk must be int32 or int64");
 
     c10::cuda::CUDAGuard deviceGuard(ijk.device());
+    at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream(ijk.device().index());
 
     static_assert(sizeof(nanovdb::Coord) == 3 * sizeof(int32_t), "nanovdb::Coord must be 3 ints");
+    static_assert(std::is_same_v<fvdb::JOffsetsType, int64_t>,
+                  "the batched Coords pass reads int64 jagged offsets");
 
-    // This guide buffer is a hack to pass in a device with an index to the cudaCreateNanoGrid
-    // function. We can't pass in a device directly but we can pass in a buffer which gets
-    // passed to TorchDeviceBuffer::create. The guide buffer holds the device and effectively
-    // passes it to the created buffer.
-    TorchDeviceBuffer guide(0, ijk.device());
-
-    // FIXME: This is slow because we have to copy this data to the host and then build the
-    // grids. Ideally we want to do this in a single invocation.
+    // Host copy of the jagged offsets: the per-grid int32 candidate-count guard and the per-grid
+    // emission slot counts of the batched pass both come from it (one device sync).
     torch::Tensor ijkBOffsetTensor = ijk.joffsets().cpu();
     auto ijkBOffset                = ijkBOffsetTensor.accessor<fvdb::JOffsetsType, 1>();
     checkCandidateCountsFitInt32(ijkBOffset);
+    const int64_t numGrids = ijkBOffset.size(0) - 1;
+    std::vector<int64_t> coordCounts(numGrids);
+    for (int64_t gi = 0; gi < numGrids; gi += 1) {
+        coordCounts[gi] = ijkBOffset[gi + 1] - ijkBOffset[gi];
+    }
+
     torch::Tensor ijkData = ijk.jdata();
     if (ijkData.scalar_type() != torch::kInt32) {
         ijkData = ijkData.to(torch::kInt32);
@@ -82,32 +85,18 @@ dispatchCreateNanoGridFromIJK<torch::kCUDA>(const JaggedTensor &ijk) {
     TORCH_CHECK(ijkData.is_contiguous(), "ijk must be contiguous");
     TORCH_CHECK(ijkData.dim() == 2, "ijk must have shape (N, 3)");
     TORCH_CHECK(ijkData.size(1) == 3, "ijk must have shape (N, 3)");
+    const torch::Tensor joffsetsDev = ijk.joffsets().contiguous();
 
-    // Create a grid for each batch item and store the handles
-    std::vector<nanovdb::GridHandle<TorchDeviceBuffer>> handles;
-    for (int i = 0; i < (ijkBOffset.size(0) - 1); i += 1) {
-        const int64_t startIdx = ijkBOffset[i];
-        const int64_t nVoxels  = ijkBOffset[i + 1] - startIdx;
-        // torch::Tensor ijkDataSlice = ijkData.narrow(0, startIdx, nVoxels);
-        const int32_t *dataPtr = ijkData.data_ptr<int32_t>() + 3 * startIdx;
-
-        handles.push_back(
-            nVoxels == 0
-                ? createEmptyGridHandle(guide.device())
-                : nanovdb::tools::cuda::
-                      voxelsToGrid<GridT, nanovdb::Coord *, TorchDeviceBuffer, BuilderResource>(
-                          (nanovdb::Coord *)dataPtr, nVoxels, 1.0, guide));
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-    }
-
-    if (handles.size() == 1) {
-        // If there's only one handle, just return it
-        return std::move(handles[0]);
-    } else {
-        // This copies all the handles into a single handle -- only do it if there are multie
-        // grids
-        return nanovdb::cuda::mergeGridHandles(handles, &guide);
-    }
+    // All batch members are built together in one batched Coords pass: one emission slot per
+    // coordinate (leaf origin + single-voxel mask bit), duplicates and coordinates sharing a leaf
+    // OR-combined, a single output buffer, one stream synchronization -- no per-member
+    // PointsToGrid builds or handle merging (issue #775). Empty members become valid empty
+    // grids inline.
+    const batched::TopologyPassSpec pass = batched::TopologyPassSpec::coords(
+        ijkData.data_ptr<int32_t>(), joffsetsDev.data_ptr<fvdb::JOffsetsType>());
+    batched::BatchedTopologyResult result = batched::runBatchedTopologyPass(
+        batched::sourceFromCoordCounts(coordCounts, ijk.device()), pass, stream.stream());
+    return nanovdb::GridHandle<TorchDeviceBuffer>(std::move(result.buffer));
 }
 
 template <>

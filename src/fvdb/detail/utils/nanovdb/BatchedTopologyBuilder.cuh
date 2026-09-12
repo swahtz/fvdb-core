@@ -11,19 +11,22 @@
 // workloads that rebuild grids every training iteration (issue #755), that per-member fixed
 // overhead -- not the topology size -- dominates wall clock and serializes the GPU.
 //
-// This header rebuilds the factor-2 refine (subdivision) and coarsen passes so one invocation
-// covers the whole batch:
+// This header rebuilds the factor-2 refine (subdivision) and coarsen passes, box dilation, and
+// coordinate-list construction (from_ijk) so one invocation covers the whole batch:
 //
-//   emit    one kernel over all source leaves of all members emits candidate output leaves as
-//           (root-tile sort key, in-tile node key, leaf origin, 512-bit activity mask) slots,
-//           segmented per grid;
-//   sort    two stable segmented radix sorts put each grid's slots in canonical NanoVDB node
-//           order (root tiles by the PointsToGrid offset-shifted key, then upper/lower child
-//           offsets); invalid slots sort to the segment tails;
-//   dedup   head-flag + scan passes derive the unique leaf/lower/upper nodes, their per-grid
-//           counts, and parent linkage (coarsen additionally OR-combines duplicate leaf masks);
+//   emit    one kernel over all emission slots of all members (source leaves, or coordinates for
+//           the Coords pass) emits candidate output leaves as (root-tile sort key, in-tile node
+//           key, leaf origin, 512-bit activity mask) slots, segmented per grid;
+//   sort    stable global radix sorts (node key, then tile key, then grid index) put each grid's
+//           slots in canonical NanoVDB node order (root tiles by the PointsToGrid offset-shifted
+//           key, then upper/lower child offsets); invalid slots sort to the segment tails;
+//   dedup   head-flag + scan passes derive the unique leaf/lower/upper nodes and their per-grid
+//           counts;
 //   size    ONE host synchronization reads back the per-grid node counts; per-grid byte offsets
-//           are computed on the host and a single output buffer is allocated;
+//           are computed on the host and a single output buffer is allocated, together with the
+//           unique-node-sized tables (head slot, parent linkage, per-leaf 512-bit masks) into
+//           which every slot's mask contribution is reduced (non-injective passes -- coarsen,
+//           dilate, coords -- OR-combine duplicate producers here);
 //   build   batched kernels write every grid's GridData/TreeData/RootData (mGridIndex = g,
 //           mGridCount = B), root tiles, upper/lower/leaf nodes, leaf mOffset/mPrefixSum, and
 //           bounding boxes. Empty members become valid empty grids inline (no host proxy grids).
@@ -33,8 +36,10 @@
 // tools::cuda::TopologyBuilder's functors with (gridIndex, localIndex) indexing. Checksums are
 // disabled on the output, matching ops::contiguousGridHandle and mergeGridHandles behavior.
 //
-// Scratch is allocated through torch (the caching allocator) on the caller's current stream. The
-// only stream synchronization per pass is the node-count readback that sizes the output buffer.
+// Scratch is allocated through torch (the caching allocator) on the caller's current stream and
+// released stage by stage so the torch-visible peak stays near one sort's working set per slot
+// (from_ijk on millions of coordinates emits one slot per coordinate). The only stream
+// synchronization per pass is the node-count readback that sizes the output buffer.
 
 #ifndef FVDB_DETAIL_UTILS_NANOVDB_BATCHEDTOPOLOGYBUILDER_CUH
 #define FVDB_DETAIL_UTILS_NANOVDB_BATCHEDTOPOLOGYBUILDER_CUH
@@ -73,11 +78,17 @@ using LeafT  = nanovdb::NanoLeaf<BuildT>;
 /// subdivision / coarsening passes; `BoxDilate` is a Minkowski sum with the axis-aligned box
 /// [boxLo, boxHi] (components in {-1,0,1}), covering NanoVDB's 26-neighbor DilateGrid
 /// (boxLo=-1, boxHi=1) and fvdb's one-sided PadGrid octants ({-1,0}^3 and {0,1}^3). Larger
-/// boxes compose from multiple passes (Minkowski sums by boxes compose).
+/// boxes compose from multiple passes (Minkowski sums by boxes compose). `Coords` builds the
+/// batch from a jagged voxel-coordinate list (from_ijk): it has no source grids, one emission
+/// slot per coordinate, and its per-grid slot counts come from `BatchedTopologySource::slotCounts`.
 struct TopologyPassSpec {
-    enum class Op { Refine, Coarsen, BoxDilate };
+    enum class Op { Refine, Coarsen, BoxDilate, Coords };
     Op op;
     nanovdb::Coord boxLo{0}, boxHi{0}; // BoxDilate only
+    // Coords only: device pointers to the N x 3 contiguous int32 coordinates and to the B+1
+    // int64 jagged offsets (JaggedTensor::joffsets) that delimit each grid's coordinates.
+    const int32_t *ijk     = nullptr;
+    const int64_t *offsets = nullptr;
 
     static TopologyPassSpec
     refine() {
@@ -91,14 +102,45 @@ struct TopologyPassSpec {
     boxDilate(const nanovdb::Coord &lo, const nanovdb::Coord &hi) {
         return {Op::BoxDilate, lo, hi};
     }
+    static TopologyPassSpec
+    coords(const int32_t *ijk, const int64_t *offsets) {
+        TopologyPassSpec spec{Op::Coords};
+        spec.ijk     = ijk;
+        spec.offsets = offsets;
+        return spec;
+    }
 };
+
+/// True for passes in which several emission slots may target the same output leaf, so the
+/// duplicates' mask contributions must be OR-combined into the unique leaf (Refine is injective).
+inline bool
+passHasDuplicateProducers(TopologyPassSpec::Op op) {
+    switch (op) {
+    case TopologyPassSpec::Op::Refine: return false;
+    case TopologyPassSpec::Op::Coarsen:
+    case TopologyPassSpec::Op::BoxDilate:
+    case TopologyPassSpec::Op::Coords: return true;
+    }
+    return true;
+}
 
 /// Device-pointer view of the B source grids of one pass. The grids may live anywhere (a
 /// GridBatchData buffer -- including sliced/non-contiguous views -- or the output buffer of a
 /// previous pass); only per-member device grid pointers and leaf counts are needed.
+///
+/// Emission slot counts: by default a pass emits leafCounts[g] * fanout(op) slots for grid g
+/// (slots are source leaves or source-leaf/neighbor pairs). A pass whose slots are not source
+/// leaves supplies its own host-known per-grid counts in `slotCounts` (the Coords pass: one slot
+/// per coordinate, counts from the jagged offsets). When `slotCounts` is non-empty it replaces the
+/// leaf-based count for every grid and `leafCounts` is not consulted.
+///
+/// Source grids are optional for passes that do not read them (Coords). With `grids` empty the
+/// batch size is `slotCounts.size()` and every output header is initialized to the default
+/// ValueOnIndex header (identity map, IndexGrid class) instead of being copied from a source grid.
 struct BatchedTopologySource {
     std::vector<const GridT *> grids; // per-member device grid pointers (host-side vector)
     std::vector<int64_t> leafCounts;  // per-member leaf counts (host-side)
+    std::vector<int64_t> slotCounts;  // optional per-member emission slot counts (host-side)
     torch::Device device{torch::kCUDA};
 };
 
@@ -227,6 +269,7 @@ struct EmissionArrays {
     uint32_t *nodeKey;            // [N] (upperChildOffset << 12) | lowerChildOffset
     int32_t *origin;              // [N*3] output leaf origin
     uint64_t *mask;               // [N*8] output leaf 512-bit activity-mask contribution
+                                  // (nullptr for Coords: the bit lives in the origin low bits)
     const int32_t *segOffsets;    // [B+1] per-grid slot ranges
     const GridT *const *srcGrids; // [B] device pointers to the source grids
     int32_t numSegments;
@@ -433,6 +476,33 @@ emitBoxDilatedLeaves(EmissionArrays em, nanovdb::Coord boxLo, nanovdb::Coord box
     }
 }
 
+/// Coords: slot = one voxel coordinate of the jagged list. The output leaf is the 8-aligned leaf
+/// containing the coordinate and the mask contribution is that single voxel's bit (Mask<3>
+/// layout via LeafNode::CoordToOffset: word = local x, byte within word = local y, bit within
+/// byte = local z). Instead of a 512-bit mask per slot, the slot stores the full coordinate in the
+/// origin array: the leaf origin is its 8-aligned part and the voxel bit is recovered from the low
+/// 3 bits of each component in reduceLeafMasks (em.mask is null for this pass). Coordinates
+/// sharing a leaf, and duplicate coordinates, are OR-combined there. Slot s of grid g is
+/// coordinate offsets[g] + (s - seg[g]).
+static __global__ void
+emitCoordLeaves(EmissionArrays em,
+                const int32_t *__restrict__ ijk,
+                const int64_t *__restrict__ offsets) {
+    for (int32_t s = blockIdx.x * blockDim.x + threadIdx.x; s < em.numSlots;
+         s += gridDim.x * blockDim.x) {
+        const int32_t g     = findSegment(em.segOffsets, em.numSegments, s);
+        const int64_t index = offsets[g] + int64_t(s - em.segOffsets[g]);
+        const nanovdb::Coord c(ijk[index * 3], ijk[index * 3 + 1], ijk[index * 3 + 2]);
+        const nanovdb::Coord leafOrigin(c[0] & ~7, c[1] & ~7, c[2] & ~7);
+
+        em.tileKey[s]                 = tileSortKey(leafOrigin);
+        em.nodeKey[s]                 = nodeSortKey(leafOrigin);
+        em.origin[originIndex(s)]     = c[0];
+        em.origin[originIndex(s) + 1] = c[1];
+        em.origin[originIndex(s) + 2] = c[2];
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Sort / dedup kernels
 // ---------------------------------------------------------------------------------------------
@@ -454,11 +524,24 @@ gatherKeys64(const uint64_t *__restrict__ keys,
     }
 }
 
+/// Grid index of the slot at each position of the current permutation (key of the final sort).
+static __global__ void
+gatherSegmentKeys(const uint32_t *__restrict__ perm,
+                  const int32_t *__restrict__ segOffsets,
+                  int32_t numSegments,
+                  uint32_t *__restrict__ out,
+                  int32_t n) {
+    for (int32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        out[i] = uint32_t(findSegment(segOffsets, numSegments, int32_t(perm[i])));
+    }
+}
+
+/// Slot payload in canonical order (masks are not permuted: reduceLeafMasks reads the emission
+/// masks through the permutation once, directly into the per-leaf mask table).
 struct SortedArrays {
     const uint64_t *tileKey; // [N] canonical order, invalid slots at segment tails
     uint32_t *nodeKey;       // [N]
-    int32_t *origin;         // [N*3]
-    uint64_t *mask;          // [N*8]
+    int32_t *origin;         // [N*3] leaf origin (Coords: full coordinate; origin = & ~7)
 };
 
 static __global__ void
@@ -473,9 +556,6 @@ gatherSorted(EmissionArrays em, const uint32_t *__restrict__ perm, SortedArrays 
         out.origin[originIndex(j)]     = em.origin[originIndex(s)];
         out.origin[originIndex(j) + 1] = em.origin[originIndex(s) + 1];
         out.origin[originIndex(j) + 2] = em.origin[originIndex(s) + 2];
-        for (int i = 0; i < 8; ++i) {
-            out.mask[maskIndex(j) + i] = em.mask[maskIndex(s) + i];
-        }
     }
 }
 
@@ -558,24 +638,46 @@ scatterNodeTables(const uint32_t *__restrict__ leafFlag,
     }
 }
 
-/// Coarsen and BoxDilate: OR every duplicate slot's mask contribution into its unique leaf's head
-/// slot. Refine is excluded because its source-to-output leaf mapping is injective.
+/// Reduces every valid slot's mask contribution into its unique leaf's 512-bit mask, in the
+/// per-leaf table indexed by global leaf rank (zero-initialized, allocated after the sizing
+/// readback). Contributions are read from the unsorted emission masks through the canonical
+/// permutation; Coords slots (emMask == nullptr) instead contribute the single voxel bit encoded
+/// in the low 3 bits of their origin components. Injective passes (Refine) have exactly one slot
+/// per leaf and store directly; Coarsen, BoxDilate and Coords (passHasDuplicateProducers)
+/// OR-combine atomically.
 static __global__ void
-combineDuplicateMasks(const uint64_t *__restrict__ tileKey,
-                      const uint32_t *__restrict__ leafFlag,
-                      const uint32_t *__restrict__ leafRank,
-                      const uint32_t *__restrict__ leafHeadSlot,
-                      int32_t n,
-                      uint64_t *__restrict__ mask) {
+reduceLeafMasks(const uint64_t *__restrict__ sortedTileKey,
+                const int32_t *__restrict__ sortedOrigin,
+                const uint32_t *__restrict__ leafRank,
+                const uint32_t *__restrict__ perm,
+                const uint64_t *__restrict__ emMask,
+                int32_t n,
+                bool injective,
+                uint64_t *__restrict__ leafMask) {
     for (int32_t j = blockIdx.x * blockDim.x + threadIdx.x; j < n; j += gridDim.x * blockDim.x) {
-        if (tileKey[j] == kInvalidTileKey || leafFlag[j]) {
+        if (sortedTileKey[j] == kInvalidTileKey) {
             continue;
         }
-        const uint32_t head = leafHeadSlot[leafRank[j] - 1];
-        for (int i = 0; i < 8; ++i) {
-            const uint64_t w = mask[maskIndex(j) + i];
-            if (w) {
-                nanovdb::util::atomicOr(&mask[maskIndex(head) + i], w);
+        uint64_t *dst = leafMask + maskIndex(leafRank[j] - 1);
+        if (emMask == nullptr) { // Coords: one voxel bit per slot
+            const nanovdb::Coord c(sortedOrigin[originIndex(j)],
+                                   sortedOrigin[originIndex(j) + 1],
+                                   sortedOrigin[originIndex(j) + 2]);
+            const uint32_t bit = LeafT::CoordToOffset(c); // ((x&7)<<6) | ((y&7)<<3) | (z&7)
+            nanovdb::util::atomicOr(&dst[bit >> 6], uint64_t(1) << (bit & 63));
+            continue;
+        }
+        const uint64_t *src = emMask + maskIndex(perm[j]);
+        if (injective) {
+            for (int i = 0; i < 8; ++i) {
+                dst[i] = src[i];
+            }
+        } else {
+            for (int i = 0; i < 8; ++i) {
+                const uint64_t w = src[i];
+                if (w) {
+                    nanovdb::util::atomicOr(&dst[i], w);
+                }
             }
         }
     }
@@ -599,6 +701,26 @@ copyGridData(const GridT *const *__restrict__ srcGrids, BuildDeviceArrays a, int
         uint64_t *dst       = reinterpret_cast<uint64_t *>(a.dstBase + a.gridByteOffsets[g]);
         dst[w]              = src[w];
     }
+}
+
+/// Header seed for passes without source grids (Coords): the default ValueOnIndex GridData that
+/// PointsToGrid's BuildGridTreeRootFunctor writes (GridData::init with the identity map, OnIndex
+/// type, IndexGrid class, empty name; the map is what a from_ijk build with voxel size 1 at the
+/// origin carries, and fvdb keeps per-grid transforms in GridBatchData metadata instead). The
+/// fields reset by initGridTreeRoot are rewritten afterwards.
+static __global__ void
+initDefaultGridData(BuildDeviceArrays a, int32_t numGrids) {
+    const int32_t g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= numGrids) {
+        return;
+    }
+    nanovdb::GridData *grid =
+        reinterpret_cast<nanovdb::GridData *>(a.dstBase + a.gridByteOffsets[g]);
+    grid->init({nanovdb::GridFlags::IsBreadthFirst},
+               a.gridByteOffsets[g + 1] - a.gridByteOffsets[g],
+               nanovdb::Map(),
+               nanovdb::toGridType<BuildT>(),
+               nanovdb::GridClass::IndexGrid);
 }
 
 /// Per-grid transcription of tools::cuda::topology::detail::BuildGridTreeRootFunctor with
@@ -702,9 +824,10 @@ buildLeafNodes(BuildDeviceArrays a,
                SortedArrays sorted,
                const uint32_t *__restrict__ leafHeadSlot,
                const uint32_t *__restrict__ leafParent,
+               const uint64_t *__restrict__ leafMask, // [totalLeaf*8] reduced activity masks
                int32_t numGrids,
                int32_t totalLeaf,
-               uint64_t *__restrict__ voxelCounts) { // [totalLeaf+1]; element 0 stays 0
+               uint64_t *__restrict__ voxelCounts) {  // [totalLeaf+1]; element 0 stays 0
     for (int32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < totalLeaf;
          t += gridDim.x * blockDim.x) {
         const int32_t g         = findSegment(a.leafStart, numGrids, uint32_t(t));
@@ -716,14 +839,14 @@ buildLeafNodes(BuildDeviceArrays a,
         LeafT &leaf             = n.leaf[local];
         lower.mChildMask.setOnAtomic(lowerOff);
         lower.setChild(lowerOff, &leaf);
-        leaf.mBBoxMin = nanovdb::Coord(sorted.origin[originIndex(slot)],
-                                       sorted.origin[originIndex(slot) + 1],
-                                       sorted.origin[originIndex(slot) + 2]);
+        leaf.mBBoxMin = nanovdb::Coord(sorted.origin[originIndex(slot)] & ~7,
+                                       sorted.origin[originIndex(slot) + 1] & ~7,
+                                       sorted.origin[originIndex(slot) + 2] & ~7);
         leaf.mFlags   = uint8_t(nanovdb::GridFlags::HasBBox);
 
         uint64_t *dstWords = leaf.mValueMask.words();
         for (int i = 0; i < 8; ++i) {
-            dstWords[i] = sorted.mask[maskIndex(slot) + i];
+            dstWords[i] = leafMask[maskIndex(t) + i];
         }
 
         // Per-leaf voxel count and the 9-bit encoded intra-leaf prefix sums (transcribed from
@@ -849,6 +972,16 @@ sourceFromResult(const BatchedTopologyResult &result, const torch::Device &devic
     return src;
 }
 
+/// Source for a Coords pass: no source grids, one emission slot per coordinate of each member
+/// (`coordCounts[g]` = joffsets[g+1] - joffsets[g], host-known).
+inline BatchedTopologySource
+sourceFromCoordCounts(const std::vector<int64_t> &coordCounts, const torch::Device &device) {
+    BatchedTopologySource src;
+    src.device     = device;
+    src.slotCounts = coordCounts;
+    return src;
+}
+
 /// Runs one batched topology pass over all grids of `src`.
 /// One cudaStreamSynchronize total (the node-count readback that sizes the output allocation).
 inline BatchedTopologyResult
@@ -856,8 +989,13 @@ runBatchedTopologyPass(const BatchedTopologySource &src,
                        const TopologyPassSpec &pass,
                        cudaStream_t stream) {
     TORCH_CHECK(src.device.is_cuda(), "batched topology passes require a CUDA device");
-    const int32_t numGrids = int32_t(src.grids.size());
+    const bool hasSourceGrids = !src.grids.empty();
+    const int32_t numGrids    = int32_t(hasSourceGrids ? src.grids.size() : src.slotCounts.size());
     TORCH_CHECK(numGrids > 0, "batched topology pass requires at least one grid");
+    TORCH_CHECK(src.slotCounts.empty() || int32_t(src.slotCounts.size()) == numGrids,
+                "batched topology pass: slotCounts must have one entry per grid");
+    TORCH_CHECK(hasSourceGrids || pass.op == TopologyPassSpec::Op::Coords,
+                "batched topology pass: only the Coords pass may run without source grids");
     int32_t fanout = 1;
     switch (pass.op) {
     case TopologyPassSpec::Op::Refine: fanout = 8; break;
@@ -870,14 +1008,20 @@ runBatchedTopologyPass(const BatchedTopologySource &src,
             fanout *= (pass.boxHi[a] > 0 ? 1 : 0) - (pass.boxLo[a] < 0 ? -1 : 0) + 1;
         }
         break;
+    case TopologyPassSpec::Op::Coords:
+        TORCH_CHECK(pass.offsets != nullptr, "Coords pass requires the jagged offsets pointer");
+        TORCH_CHECK(!src.slotCounts.empty(),
+                    "Coords pass requires per-grid slot counts (coordinates per grid)");
+        break;
     }
 
-    // Per-grid emission slot ranges (host-known: leaf counts x fanout; no sync needed).
+    // Per-grid emission slot ranges (host-known: caller-supplied slot counts, or leaf counts x
+    // fanout; no sync needed).
     std::vector<int32_t> segOffsetsHost(numGrids + 1, 0);
     int64_t total = 0;
     for (int32_t g = 0; g < numGrids; ++g) {
         segOffsetsHost[g] = int32_t(total);
-        total += src.leafCounts[g] * fanout;
+        total += src.slotCounts.empty() ? src.leafCounts[g] * fanout : src.slotCounts[g];
     }
     TORCH_CHECK(total <= std::numeric_limits<int32_t>::max(),
                 "batched topology pass: emission slot count ",
@@ -885,6 +1029,10 @@ runBatchedTopologyPass(const BatchedTopologySource &src,
                 " exceeds int32 range");
     segOffsetsHost[numGrids] = int32_t(total);
     const int32_t numSlots   = int32_t(total);
+    // A zero-size torch tensor has a null data_ptr, so an all-empty coordinate batch legitimately
+    // carries ijk == nullptr; the pointer is only dereferenced when there are slots to emit.
+    TORCH_CHECK(pass.op != TopologyPassSpec::Op::Coords || numSlots == 0 || pass.ijk != nullptr,
+                "Coords pass requires the coordinate device pointer");
     const int64_t allocSlots = std::max(numSlots, 1); // torch::empty({0}) yields a null data_ptr
 
     const auto byteOpts = torch::TensorOptions().dtype(torch::kUInt8).device(src.device);
@@ -912,32 +1060,39 @@ runBatchedTopologyPass(const BatchedTopologySource &src,
     // Small host-side staging uploaded once per pass: segment offsets + source grid pointers.
     // (Pageable H2D copies are synchronous with the host but do not synchronize the stream.)
     torch::Tensor segOffsetsDev = torch::empty({numGrids + 1}, i32Opts);
-    torch::Tensor srcGridsDev   = torch::empty({numGrids}, i64Opts);
+    torch::Tensor srcGridsDev   = torch::empty({hasSourceGrids ? numGrids : 0}, i64Opts);
     C10_CUDA_CHECK(cudaMemcpyAsync(segOffsetsDev.data_ptr<int32_t>(),
                                    segOffsetsHost.data(),
                                    sizeof(int32_t) * (numGrids + 1),
                                    cudaMemcpyHostToDevice,
                                    stream));
     static_assert(sizeof(const GridT *) == sizeof(int64_t));
-    C10_CUDA_CHECK(cudaMemcpyAsync(srcGridsDev.data_ptr<int64_t>(),
-                                   src.grids.data(),
-                                   sizeof(const GridT *) * numGrids,
-                                   cudaMemcpyHostToDevice,
-                                   stream));
+    if (hasSourceGrids) {
+        C10_CUDA_CHECK(cudaMemcpyAsync(srcGridsDev.data_ptr<int64_t>(),
+                                       src.grids.data(),
+                                       sizeof(const GridT *) * numGrids,
+                                       cudaMemcpyHostToDevice,
+                                       stream));
+    }
 
-    // --- Emit candidate output leaves. ---
+    // --- Emit candidate output leaves. Scratch tensors are released (reassigned to an empty
+    // tensor) as soon as the last consumer has been enqueued; the caching allocator only reuses
+    // freed blocks on this stream, so no host/device ordering issue arises. ---
+    const bool isCoords     = pass.op == TopologyPassSpec::Op::Coords;
     torch::Tensor emTileKey = torch::empty({allocSlots}, i64Opts);
     torch::Tensor emNodeKey = torch::empty({allocSlots}, i32Opts);
     torch::Tensor emOrigin  = torch::empty({allocSlots * 3}, i32Opts);
-    torch::Tensor emMask    = torch::empty({allocSlots * 8}, i64Opts);
+    torch::Tensor emMask    = torch::empty({isCoords ? 0 : allocSlots * 8}, i64Opts);
 
     EmissionArrays em;
     em.tileKey     = u64(emTileKey);
     em.nodeKey     = u32(emNodeKey);
     em.origin      = emOrigin.data_ptr<int32_t>();
-    em.mask        = u64(emMask);
+    em.mask        = isCoords ? nullptr : u64(emMask);
     em.segOffsets  = segOffsetsDev.data_ptr<int32_t>();
-    em.srcGrids    = reinterpret_cast<const GridT *const *>(srcGridsDev.data_ptr<int64_t>());
+    em.srcGrids    = hasSourceGrids
+                         ? reinterpret_cast<const GridT *const *>(srcGridsDev.data_ptr<int64_t>())
+                         : nullptr;
     em.numSegments = numGrids;
     em.numSlots    = numSlots;
 
@@ -953,36 +1108,43 @@ runBatchedTopologyPass(const BatchedTopologySource &src,
             emitBoxDilatedLeaves<<<numBlocks(numSlots), kThreads, 0, stream>>>(
                 em, pass.boxLo, pass.boxHi);
             break;
+        case TopologyPassSpec::Op::Coords:
+            emitCoordLeaves<<<numBlocks(numSlots), kThreads, 0, stream>>>(
+                em, pass.ijk, pass.offsets);
+            break;
         }
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 
-    // --- Canonical-order segmented sort: stable by node key, then stable by tile key. ---
+    // --- Canonical-order sort: stable global radix sorts by node key, then tile key, then grid
+    // index compose (LSD) to (grid, tile, node) order within every segment. Global rather than
+    // segmented sorts: cub::DeviceSegmentedRadixSort assigns one thread block per segment, which
+    // serializes a large member (a single 1M-coordinate grid sorted on one SM took 16 ms). The
+    // grid-index sort is skipped for a single grid. ---
     torch::Tensor permA   = torch::empty({allocSlots}, i32Opts);
     torch::Tensor permB   = torch::empty({allocSlots}, i32Opts);
     torch::Tensor keysTmp = torch::empty({allocSlots}, i32Opts);
     torch::Tensor keys64A = torch::empty({allocSlots}, i64Opts);
     torch::Tensor keys64B = torch::empty({allocSlots}, i64Opts);
+    uint32_t *perm        = u32(permA);   // canonical-order permutation once the sorts are done
+    uint64_t *sortedTile  = u64(keys64B); // tile keys in canonical order
 
     if (numSlots > 0) {
         iotaKernel<<<numBlocks(numSlots), kThreads, 0, stream>>>(u32(permA), numSlots);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-        // Pass 1: sort by the 27-bit in-tile node key.
+        // Pass 1: sort by the 27-bit in-tile node key (sorted keys themselves are not needed).
         callCub([&](void *temp, size_t &bytes) {
-            C10_CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(temp,
-                                                                    bytes,
-                                                                    em.nodeKey,
-                                                                    u32(keysTmp),
-                                                                    u32(permA),
-                                                                    u32(permB),
-                                                                    numSlots,
-                                                                    numGrids,
-                                                                    em.segOffsets,
-                                                                    em.segOffsets + 1,
-                                                                    0,
-                                                                    27,
-                                                                    stream));
+            C10_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(temp,
+                                                           bytes,
+                                                           em.nodeKey,
+                                                           u32(keysTmp),
+                                                           u32(permA),
+                                                           u32(permB),
+                                                           numSlots,
+                                                           0,
+                                                           27,
+                                                           stream));
         });
 
         // Pass 2: stable sort by the 64-bit tile key (invalid slots carry ~0 and sort last).
@@ -991,34 +1153,64 @@ runBatchedTopologyPass(const BatchedTopologySource &src,
         C10_CUDA_KERNEL_LAUNCH_CHECK();
 
         callCub([&](void *temp, size_t &bytes) {
-            C10_CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(temp,
-                                                                    bytes,
-                                                                    u64(keys64A),
-                                                                    u64(keys64B),
-                                                                    u32(permB),
-                                                                    u32(permA),
-                                                                    numSlots,
-                                                                    numGrids,
-                                                                    em.segOffsets,
-                                                                    em.segOffsets + 1,
-                                                                    0,
-                                                                    64,
-                                                                    stream));
+            C10_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(temp,
+                                                           bytes,
+                                                           u64(keys64A),
+                                                           u64(keys64B),
+                                                           u32(permB),
+                                                           u32(permA),
+                                                           numSlots,
+                                                           0,
+                                                           64,
+                                                           stream));
         });
+
+        if (numGrids > 1) {
+            // Pass 3: stable sort by grid index (ceil(log2 B) bits) restores the segmentation.
+            gatherSegmentKeys<<<numBlocks(numSlots), kThreads, 0, stream>>>(
+                u32(permA), em.segOffsets, numGrids, u32(keysTmp), numSlots);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            int gridBits = 1;
+            while ((int64_t(1) << gridBits) < numGrids) {
+                ++gridBits;
+            }
+            callCub([&](void *temp, size_t &bytes) {
+                C10_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+                    temp,
+                    bytes,
+                    u32(keysTmp),
+                    reinterpret_cast<uint32_t *>(u64(keys64A)), // scratch for the sorted keys
+                    u32(permA),
+                    u32(permB),
+                    numSlots,
+                    0,
+                    gridBits,
+                    stream));
+            });
+            perm = u32(permB);
+            gatherKeys64<<<numBlocks(numSlots), kThreads, 0, stream>>>(
+                em.tileKey, perm, u64(keys64B), numSlots);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }
     }
-    // From here on: permA = canonical-order permutation, keys64B = sorted tile keys.
+    if (perm == u32(permB)) {
+        permA = torch::Tensor();
+    } else {
+        permB = torch::Tensor();
+    }
+    keysTmp = torch::Tensor();
+    keys64A = torch::Tensor();
+    // From here on: perm = canonical-order permutation, sortedTile = sorted tile keys.
 
     torch::Tensor sortedNodeKey = torch::empty({allocSlots}, i32Opts);
     torch::Tensor sortedOrigin  = torch::empty({allocSlots * 3}, i32Opts);
-    torch::Tensor sortedMask    = torch::empty({allocSlots * 8}, i64Opts);
 
     SortedArrays sorted;
-    sorted.tileKey = u64(keys64B);
+    sorted.tileKey = sortedTile;
     sorted.nodeKey = u32(sortedNodeKey);
     sorted.origin  = sortedOrigin.data_ptr<int32_t>();
-    sorted.mask    = u64(sortedMask);
 
-    // --- Dedup: head flags, global node ranks, per-grid offsets, parent linkage. ---
+    // --- Dedup: head flags, global node ranks, per-grid offsets. ---
     torch::Tensor leafFlag  = torch::empty({allocSlots}, i32Opts);
     torch::Tensor lowerFlag = torch::empty({allocSlots}, i32Opts);
     torch::Tensor upperFlag = torch::empty({allocSlots}, i32Opts);
@@ -1026,15 +1218,16 @@ runBatchedTopologyPass(const BatchedTopologySource &src,
     torch::Tensor lowerRank = torch::empty({allocSlots}, i32Opts);
     torch::Tensor upperRank = torch::empty({allocSlots}, i32Opts);
 
-    torch::Tensor leafHeadSlot  = torch::empty({allocSlots}, i32Opts);
-    torch::Tensor leafParent    = torch::empty({allocSlots}, i32Opts);
-    torch::Tensor lowerHeadSlot = torch::empty({allocSlots}, i32Opts);
-    torch::Tensor lowerParent   = torch::empty({allocSlots}, i32Opts);
-    torch::Tensor upperHeadSlot = torch::empty({allocSlots}, i32Opts);
-
     if (numSlots > 0) {
-        gatherSorted<<<numBlocks(numSlots), kThreads, 0, stream>>>(em, u32(permA), sorted);
+        gatherSorted<<<numBlocks(numSlots), kThreads, 0, stream>>>(em, perm, sorted);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
+        // The unsorted emission masks stay alive (read through perm by reduceLeafMasks).
+        emTileKey  = torch::Tensor();
+        emNodeKey  = torch::Tensor();
+        emOrigin   = torch::Tensor();
+        em.tileKey = nullptr;
+        em.nodeKey = nullptr;
+        em.origin  = nullptr;
 
         computeHeadFlags<<<numBlocks(numSlots), kThreads, 0, stream>>>(sorted.tileKey,
                                                                        sorted.nodeKey,
@@ -1053,30 +1246,6 @@ runBatchedTopologyPass(const BatchedTopologySource &src,
                 C10_CUDA_CHECK(cub::DeviceScan::InclusiveSum(
                     temp, bytes, u32(*flags), u32(*ranks), numSlots, stream));
             });
-        }
-
-        scatterNodeTables<<<numBlocks(numSlots), kThreads, 0, stream>>>(u32(leafFlag),
-                                                                        u32(lowerFlag),
-                                                                        u32(upperFlag),
-                                                                        u32(leafRank),
-                                                                        u32(lowerRank),
-                                                                        u32(upperRank),
-                                                                        numSlots,
-                                                                        u32(leafHeadSlot),
-                                                                        u32(leafParent),
-                                                                        u32(lowerHeadSlot),
-                                                                        u32(lowerParent),
-                                                                        u32(upperHeadSlot));
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-        if (pass.op != TopologyPassSpec::Op::Refine) { // coarsen/dilate have duplicate producers
-            combineDuplicateMasks<<<numBlocks(numSlots), kThreads, 0, stream>>>(sorted.tileKey,
-                                                                                u32(leafFlag),
-                                                                                u32(leafRank),
-                                                                                u32(leafHeadSlot),
-                                                                                numSlots,
-                                                                                sorted.mask);
-            C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
     }
 
@@ -1149,10 +1318,63 @@ runBatchedTopologyPass(const BatchedTopologySource &src,
     build.lowerStart      = u32(lowerStart);
     build.leafStart       = u32(leafStart);
 
-    // --- Build all grids. ---
-    constexpr int32_t kGridDataWords = int32_t(sizeof(nanovdb::GridData) / sizeof(uint64_t));
-    copyGridData<<<numBlocks(numGrids * kGridDataWords), kThreads, 0, stream>>>(
-        em.srcGrids, build, numGrids);
+    // --- Unique-node tables (sized by the readback, not by slot count): head slot and parent
+    // linkage per node, and the reduced 512-bit activity mask per leaf. ---
+    torch::Tensor leafHeadSlot  = torch::empty({std::max(totalLeaf, 1)}, i32Opts);
+    torch::Tensor leafParent    = torch::empty({std::max(totalLeaf, 1)}, i32Opts);
+    torch::Tensor lowerHeadSlot = torch::empty({std::max(totalLower, 1)}, i32Opts);
+    torch::Tensor lowerParent   = torch::empty({std::max(totalLower, 1)}, i32Opts);
+    torch::Tensor upperHeadSlot = torch::empty({std::max(totalUpper, 1)}, i32Opts);
+    torch::Tensor leafMask      = torch::zeros({int64_t(std::max(totalLeaf, 1)) * 8}, i64Opts);
+
+    if (numSlots > 0) {
+        scatterNodeTables<<<numBlocks(numSlots), kThreads, 0, stream>>>(u32(leafFlag),
+                                                                        u32(lowerFlag),
+                                                                        u32(upperFlag),
+                                                                        u32(leafRank),
+                                                                        u32(lowerRank),
+                                                                        u32(upperRank),
+                                                                        numSlots,
+                                                                        u32(leafHeadSlot),
+                                                                        u32(leafParent),
+                                                                        u32(lowerHeadSlot),
+                                                                        u32(lowerParent),
+                                                                        u32(upperHeadSlot));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+        reduceLeafMasks<<<numBlocks(numSlots), kThreads, 0, stream>>>(
+            sorted.tileKey,
+            sorted.origin,
+            u32(leafRank),
+            perm,
+            em.mask,
+            numSlots,
+            !passHasDuplicateProducers(pass.op),
+            u64(leafMask));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    // Per-slot scratch no longer needed by the build kernels (they index the unique-node tables
+    // and read only the head slots' node keys / origins).
+    leafFlag  = torch::Tensor();
+    lowerFlag = torch::Tensor();
+    upperFlag = torch::Tensor();
+    leafRank  = torch::Tensor();
+    lowerRank = torch::Tensor();
+    upperRank = torch::Tensor();
+    permA     = torch::Tensor();
+    permB     = torch::Tensor();
+    emMask    = torch::Tensor();
+    em.mask   = nullptr;
+
+    // --- Build all grids. Headers are seeded from the source grids when the pass has them, else
+    // from the default ValueOnIndex header. ---
+    if (hasSourceGrids) {
+        constexpr int32_t kGridDataWords = int32_t(sizeof(nanovdb::GridData) / sizeof(uint64_t));
+        copyGridData<<<numBlocks(numGrids * kGridDataWords), kThreads, 0, stream>>>(
+            em.srcGrids, build, numGrids);
+    } else {
+        initDefaultGridData<<<numBlocks(numGrids), kThreads, 0, stream>>>(build, numGrids);
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     initGridTreeRoot<<<numBlocks(numGrids), kThreads, 0, stream>>>(build, numGrids);
@@ -1173,6 +1395,7 @@ runBatchedTopologyPass(const BatchedTopologySource &src,
                                                                       sorted,
                                                                       u32(leafHeadSlot),
                                                                       u32(leafParent),
+                                                                      u64(leafMask),
                                                                       numGrids,
                                                                       totalLeaf,
                                                                       u64(voxelCounts));
