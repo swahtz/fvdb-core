@@ -1,6 +1,7 @@
 // Copyright Contributors to the OpenVDB Project
 // SPDX-License-Identifier: Apache-2.0
 //
+#include <fvdb/BuilderResource.h>
 #include <fvdb/GridBatchData.h>
 #include <fvdb/detail/GridBatchDataFactory.h>
 #include <fvdb/detail/ops/BuildGridFromIjk.h>
@@ -34,7 +35,8 @@ nanovdb::GridHandle<TorchDeviceBuffer> dispatchCreateNanoGridFromIJK(const Jagge
 // NanoVDB's PointsToGrid / DistributedPointsToGrid radix sort casts the per-grid coordinate count
 // to int32 (PointsToGrid.cuh:645), which silently corrupts the grid above 2^31 candidates, and the
 // batched Coords pass indexes its emission slots (one per coordinate) with int32 as well. Reject
-// that here rather than return a garbage grid. Takes an already-on-host joffsets accessor so each
+// that here (on every CUDA path: single-member PointsToGrid and multi-member Coords) rather than
+// return a garbage grid. Takes an already-on-host joffsets accessor so each
 // dispatch reuses the host copy it makes anyway -- no extra device sync.
 static void
 checkCandidateCountsFitInt32(const torch::TensorAccessor<fvdb::JOffsetsType, 1> &joffsetsAcc) {
@@ -51,51 +53,141 @@ checkCandidateCountsFitInt32(const torch::TensorAccessor<fvdb::JOffsetsType, 1> 
     }
 }
 
-template <>
-nanovdb::GridHandle<TorchDeviceBuffer>
-dispatchCreateNanoGridFromIJK<torch::kCUDA>(const JaggedTensor &ijk) {
+// Shared argument validation of `_createNanoGridFromIJK` and `batchedCoordsPassFromIJK`.
+static void
+checkIjkArguments(const JaggedTensor &ijk) {
+    TORCH_CHECK_VALUE(
+        ijk.ldim() == 1,
+        "Expected coords to have 1 list dimension, i.e. be a single list of coordinate values, but got",
+        ijk.ldim(),
+        "list dimensions");
+    TORCH_CHECK_TYPE(at::isIntegralType(ijk.scalar_type(), false), "ijk must have an integer type");
+    TORCH_CHECK_VALUE(ijk.rdim() == 2,
+                      std::string("Expected ijk to have 2 dimensions (shape (n, 3)) but got ") +
+                          std::to_string(ijk.rdim()) + " dimensions");
+    TORCH_CHECK_VALUE(ijk.rsize(1) == 3,
+                      "Expected 3 dimensional coords but got ijk.rshape[1] = " +
+                          std::to_string(ijk.rsize(1)));
+    TORCH_CHECK(ijk.num_tensors() == ijk.num_outer_lists(),
+                "If this happens, Francis' paranoia was justified. File a bug");
+    TORCH_CHECK_VALUE(ijk.num_outer_lists() <= GridBatchData::MAX_GRIDS_PER_BATCH,
+                      "Cannot create a batch of grids with more than ",
+                      GridBatchData::MAX_GRIDS_PER_BATCH,
+                      " grids in it. ",
+                      "You passed in ",
+                      ijk.num_outer_lists(),
+                      " ijk sets.");
+    const int64_t numGrids = ijk.joffsets().size(0) - 1;
+    TORCH_CHECK(numGrids == ijk.num_outer_lists(),
+                "If this happens, Francis' paranoia was justified. File a bug");
+}
+
+namespace {
+
+// Validated CUDA from_ijk input: int32 contiguous (N, 3) coordinates, the device jagged offsets,
+// and the host-side per-member coordinate counts (from the one host copy of joffsets that the
+// int32 candidate-count guard makes anyway).
+struct CudaIjkInput {
+    torch::Tensor ijkData;     // int32, contiguous, (N, 3)
+    torch::Tensor joffsetsDev; // int64, contiguous, (B + 1)
+    std::vector<int64_t> coordCounts;
+    at::cuda::CUDAStream stream;
+};
+
+CudaIjkInput
+prepareCudaIjk(const JaggedTensor &ijk) {
     TORCH_CHECK(ijk.is_contiguous(), "ijk must be contiguous");
     TORCH_CHECK(ijk.device().is_cuda(), "device must be cuda");
     TORCH_CHECK(ijk.device().has_index(), "device must have index");
     TORCH_CHECK(ijk.scalar_type() == torch::kInt32 || ijk.scalar_type() == torch::kInt64,
                 "ijk must be int32 or int64");
 
-    c10::cuda::CUDAGuard deviceGuard(ijk.device());
-    at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream(ijk.device().index());
-
     static_assert(sizeof(nanovdb::Coord) == 3 * sizeof(int32_t), "nanovdb::Coord must be 3 ints");
     static_assert(std::is_same_v<fvdb::JOffsetsType, int64_t>,
                   "the batched Coords pass reads int64 jagged offsets");
 
-    // Host copy of the jagged offsets: the per-grid int32 candidate-count guard and the per-grid
-    // emission slot counts of the batched pass both come from it (one device sync).
+    CudaIjkInput in{
+        torch::Tensor(), torch::Tensor(), {}, at::cuda::getCurrentCUDAStream(ijk.device().index())};
+
     torch::Tensor ijkBOffsetTensor = ijk.joffsets().cpu();
     auto ijkBOffset                = ijkBOffsetTensor.accessor<fvdb::JOffsetsType, 1>();
     checkCandidateCountsFitInt32(ijkBOffset);
     const int64_t numGrids = ijkBOffset.size(0) - 1;
-    std::vector<int64_t> coordCounts(numGrids);
+    in.coordCounts.resize(numGrids);
     for (int64_t gi = 0; gi < numGrids; gi += 1) {
-        coordCounts[gi] = ijkBOffset[gi + 1] - ijkBOffset[gi];
+        in.coordCounts[gi] = ijkBOffset[gi + 1] - ijkBOffset[gi];
     }
 
-    torch::Tensor ijkData = ijk.jdata();
-    if (ijkData.scalar_type() != torch::kInt32) {
-        ijkData = ijkData.to(torch::kInt32);
+    in.ijkData = ijk.jdata();
+    if (in.ijkData.scalar_type() != torch::kInt32) {
+        in.ijkData = in.ijkData.to(torch::kInt32);
     }
-    TORCH_CHECK(ijkData.is_contiguous(), "ijk must be contiguous");
-    TORCH_CHECK(ijkData.dim() == 2, "ijk must have shape (N, 3)");
-    TORCH_CHECK(ijkData.size(1) == 3, "ijk must have shape (N, 3)");
-    const torch::Tensor joffsetsDev = ijk.joffsets().contiguous();
+    TORCH_CHECK(in.ijkData.is_contiguous(), "ijk must be contiguous");
+    TORCH_CHECK(in.ijkData.dim() == 2, "ijk must have shape (N, 3)");
+    TORCH_CHECK(in.ijkData.size(1) == 3, "ijk must have shape (N, 3)");
+    in.joffsetsDev = ijk.joffsets().contiguous();
+    return in;
+}
 
-    // All batch members are built together in one batched Coords pass: one emission slot per
-    // coordinate (leaf origin + single-voxel mask bit), duplicates and coordinates sharing a leaf
-    // OR-combined, a single output buffer, one stream synchronization -- no per-member
-    // PointsToGrid builds or handle merging (issue #775). Empty members become valid empty
-    // grids inline.
+// Single-member build: NanoVDB's PointsToGrid, as before the batched pass. It is kept for B == 1
+// because the Coords pass gains almost nothing in time there (there is no per-member overhead to
+// remove) while holding more scratch per coordinate (about 148 MiB vs 88 MiB of torch-visible
+// peak for 2M coordinates).
+nanovdb::GridHandle<TorchDeviceBuffer>
+pointsToGridSingle(const CudaIjkInput &in, const torch::Device &device) {
+    using GridT = nanovdb::ValueOnIndex;
+    TORCH_CHECK(in.coordCounts.size() == 1, "pointsToGridSingle expects exactly one member");
+    const int64_t nVoxels = in.coordCounts[0];
+    if (nVoxels == 0) {
+        return createEmptyGridHandle(device);
+    }
+    // The guide buffer carries the device (with index) into TorchDeviceBuffer::create.
+    TorchDeviceBuffer guide(0, device);
+    auto handle = nanovdb::tools::cuda::
+        voxelsToGrid<GridT, nanovdb::Coord *, TorchDeviceBuffer, BuilderResource>(
+            reinterpret_cast<nanovdb::Coord *>(in.ijkData.data_ptr<int32_t>()),
+            nVoxels,
+            1.0,
+            guide);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return handle;
+}
+
+// Multi-member build: all batch members together in one batched Coords pass -- one emission slot
+// per coordinate (leaf origin + single-voxel mask bit), duplicates and coordinates sharing a leaf
+// OR-combined, a single output buffer, one stream synchronization; no per-member PointsToGrid
+// builds or handle merging (issue #775). Empty members become valid empty grids inline.
+batched::BatchedTopologyResult
+coordsPassMulti(const CudaIjkInput &in, const torch::Device &device) {
     const batched::TopologyPassSpec pass = batched::TopologyPassSpec::coords(
-        ijkData.data_ptr<int32_t>(), joffsetsDev.data_ptr<fvdb::JOffsetsType>());
-    batched::BatchedTopologyResult result = batched::runBatchedTopologyPass(
-        batched::sourceFromCoordCounts(coordCounts, ijk.device()), pass, stream.stream());
+        in.ijkData.data_ptr<int32_t>(), in.joffsetsDev.data_ptr<fvdb::JOffsetsType>());
+    return batched::runBatchedTopologyPass(
+        batched::sourceFromCoordCounts(in.coordCounts, device), pass, in.stream.stream());
+}
+
+} // namespace
+
+batched::BatchedTopologyResult
+batchedCoordsPassFromIJK(const JaggedTensor &ijk) {
+    checkIjkArguments(ijk);
+    c10::cuda::CUDAGuard deviceGuard(ijk.device());
+    const CudaIjkInput in = prepareCudaIjk(ijk);
+    if (in.coordCounts.size() == 1) {
+        return batched::resultFromGridHandle(pointsToGridSingle(in, ijk.device()),
+                                             in.stream.stream());
+    }
+    return coordsPassMulti(in, ijk.device());
+}
+
+template <>
+nanovdb::GridHandle<TorchDeviceBuffer>
+dispatchCreateNanoGridFromIJK<torch::kCUDA>(const JaggedTensor &ijk) {
+    c10::cuda::CUDAGuard deviceGuard(ijk.device());
+    const CudaIjkInput in = prepareCudaIjk(ijk);
+    if (in.coordCounts.size() == 1) {
+        return pointsToGridSingle(in, ijk.device());
+    }
+    batched::BatchedTopologyResult result = coordsPassMulti(in, ijk.device());
     return nanovdb::GridHandle<TorchDeviceBuffer>(std::move(result.buffer));
 }
 
@@ -227,30 +319,7 @@ dispatchCreateNanoGridFromIJK<torch::kCPU>(const JaggedTensor &jaggedCoords) {
 
 nanovdb::GridHandle<TorchDeviceBuffer>
 _createNanoGridFromIJK(const JaggedTensor &ijk) {
-    TORCH_CHECK_VALUE(
-        ijk.ldim() == 1,
-        "Expected coords to have 1 list dimension, i.e. be a single list of coordinate values, but got",
-        ijk.ldim(),
-        "list dimensions");
-    TORCH_CHECK_TYPE(at::isIntegralType(ijk.scalar_type(), false), "ijk must have an integer type");
-    TORCH_CHECK_VALUE(ijk.rdim() == 2,
-                      std::string("Expected ijk to have 2 dimensions (shape (n, 3)) but got ") +
-                          std::to_string(ijk.rdim()) + " dimensions");
-    TORCH_CHECK_VALUE(ijk.rsize(1) == 3,
-                      "Expected 3 dimensional coords but got ijk.rshape[1] = " +
-                          std::to_string(ijk.rsize(1)));
-    TORCH_CHECK(ijk.num_tensors() == ijk.num_outer_lists(),
-                "If this happens, Francis' paranoia was justified. File a bug");
-    TORCH_CHECK_VALUE(ijk.num_outer_lists() <= GridBatchData::MAX_GRIDS_PER_BATCH,
-                      "Cannot create a batch of grids with more than ",
-                      GridBatchData::MAX_GRIDS_PER_BATCH,
-                      " grids in it. ",
-                      "You passed in ",
-                      ijk.num_outer_lists(),
-                      " ijk sets.");
-    const int64_t numGrids = ijk.joffsets().size(0) - 1;
-    TORCH_CHECK(numGrids == ijk.num_outer_lists(),
-                "If this happens, Francis' paranoia was justified. File a bug");
+    checkIjkArguments(ijk);
 
     // The >2^31-candidate overflow guard runs inside each dispatch (checkCandidateCountsFitInt32),
     // reusing the host joffsets copy those paths already make -- no extra device sync here.

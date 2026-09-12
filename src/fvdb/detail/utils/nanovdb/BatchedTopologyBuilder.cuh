@@ -944,6 +944,36 @@ finalizeGrids(BuildDeviceArrays a, const uint64_t *__restrict__ voxelScan, int32
 // Host driver
 // ---------------------------------------------------------------------------------------------
 
+/// Wraps an already-built contiguous device handle as a pass result so further batched passes can
+/// be chained onto it through `sourceFromResult` (used by the single-member PointsToGrid fallback
+/// of from_ijk). Grid byte sizes are host-known from the handle metadata; the per-grid leaf counts
+/// are read back from the device tree headers (one stream synchronization).
+inline BatchedTopologyResult
+resultFromGridHandle(nanovdb::GridHandle<TorchDeviceBuffer> &&handle, cudaStream_t stream) {
+    const uint32_t numGrids = handle.gridCount();
+    TORCH_CHECK(numGrids > 0 && handle.buffer().deviceData() != nullptr,
+                "resultFromGridHandle requires a non-empty device handle");
+    BatchedTopologyResult result;
+    result.gridByteOffsets.resize(numGrids + 1);
+    result.leafCounts.resize(numGrids);
+    std::vector<nanovdb::TreeData> trees(numGrids);
+    uint64_t offset = 0;
+    for (uint32_t g = 0; g < numGrids; ++g) {
+        result.gridByteOffsets[g] = offset;
+        const uint8_t *tree       = handle.buffer().deviceData() + offset + GridT::memUsage();
+        C10_CUDA_CHECK(cudaMemcpyAsync(
+            &trees[g], tree, sizeof(nanovdb::TreeData), cudaMemcpyDeviceToHost, stream));
+        offset += handle.gridSize(g);
+    }
+    result.gridByteOffsets[numGrids] = offset;
+    C10_CUDA_CHECK(cudaStreamSynchronize(stream));
+    for (uint32_t g = 0; g < numGrids; ++g) {
+        result.leafCounts[g] = trees[g].mNodeCount[0];
+    }
+    result.buffer = std::move(handle.buffer());
+    return result;
+}
+
 inline BatchedTopologySource
 sourceFromGridBatch(const GridBatchData &batch) {
     BatchedTopologySource src;

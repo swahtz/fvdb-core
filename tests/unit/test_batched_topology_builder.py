@@ -316,6 +316,51 @@ class TestBatchedTopologyBuilder(unittest.TestCase):
         self.assertTrue(torch.equal(rebuilt.ijk.jdata, result.ijk.jdata), f"{name} from_ijk idempotence")
         self.assertTrue(torch.equal(rebuilt.num_voxels, result.num_voxels), f"{name} from_ijk idempotence counts")
 
+    def test_from_ijk_single_member_fallback_and_pairs(self):
+        # B == 1 keeps NanoVDB's PointsToGrid (lower peak memory); B >= 2 runs the batched Coords
+        # pass. Every single-member build must equal the corresponding member of a two-member
+        # build elementwise, and both must reproduce the canonical order captured from the old
+        # per-member PointsToGrid path.
+        for name in ("tile_boundaries", "neg_tile_straddle", "heavy_duplicates", "empty_members"):
+            coords = _from_ijk_batches()[name]
+            singles = [_build([c], "cuda") for c in coords]
+            for b in range(len(coords) - 1):
+                pair = _build(coords[b : b + 2], "cuda")
+                self.assertEqual(pair.grid_count, 2)
+                for k in range(2):
+                    single = singles[b + k]
+                    msg = f"{name} pair ({b},{b + 1}) member {k}"
+                    self.assertTrue(torch.equal(pair.ijk.unbind()[k], single.ijk.jdata), msg)
+                    self.assertTrue(torch.equal(pair.num_voxels[k : k + 1], single.num_voxels), msg)
+                    self.assertTrue(torch.equal(pair.bbox_at(k), single.bbox_at(0)), f"{msg} bbox")
+            for b, single in enumerate(singles):
+                pinned = _FROM_IJK_CANONICAL_ORDER.get((name, b))
+                if pinned is not None:
+                    self.assertEqual(single.ijk.jdata.cpu().tolist(), pinned, f"{name} B=1 member {b} order")
+                    pair = _build(coords[b : b + 2] if b + 1 < len(coords) else coords[b - 1 : b + 1], "cuda")
+                    k = 0 if b + 1 < len(coords) else 1
+                    self.assertEqual(pair.ijk.unbind()[k].cpu().tolist(), pinned, f"{name} B=2 member {b} order")
+
+    def test_from_points_single_member_fallback_and_pairs(self):
+        torch.manual_seed(5)
+        pts = [torch.rand(3000, 3) * 40 - 20, torch.empty(0, 3), torch.rand(2000, 3) * 4 - 2]
+        for layout in ("packed", "strided"):
+
+            def prep(p):
+                p = p.cuda()
+                if layout == "strided":
+                    p = torch.cat([p, torch.zeros_like(p)], dim=1)[:, :3]
+                return p
+
+            singles = [GridBatch.from_points(JaggedTensor([prep(p)]), voxel_sizes=0.1, origins=0.0) for p in pts]
+            for b in range(len(pts) - 1):
+                pair = GridBatch.from_points(
+                    JaggedTensor([prep(p) for p in pts[b : b + 2]]), voxel_sizes=0.1, origins=0.0
+                )
+                self._check_multi_member_equals_per_member(pair, singles[b : b + 2], f"from_points {layout} pair {b}")
+            cpu = GridBatch.from_points(JaggedTensor([pts[0]]), voxel_sizes=0.1, origins=0.0)
+            self._check_against_cpu(singles[0], cpu, f"from_points {layout} B=1 vs CPU")
+
     def _check_multi_member_equals_per_member(self, multi: GridBatch, singles, msg: str):
         self.assertEqual(multi.grid_count, len(singles), msg)
         for b, single in enumerate(singles):

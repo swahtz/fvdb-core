@@ -1,6 +1,7 @@
 // Copyright Contributors to the OpenVDB Project
 // SPDX-License-Identifier: Apache-2.0
 //
+#include <fvdb/BuilderResource.h>
 #include <fvdb/GridBatchData.h>
 #include <fvdb/detail/GridBatchDataFactory.h>
 #include <fvdb/detail/ops/BuildGridFromIjk.h>
@@ -10,14 +11,18 @@
 #include <fvdb/detail/utils/cuda/ForEachCUDA.cuh>
 #include <fvdb/detail/utils/cuda/ForEachPrivateUse1.cuh>
 #include <fvdb/detail/utils/cuda/RAIIRawDeviceBuffer.h>
+#include <fvdb/detail/utils/nanovdb/CreateEmptyGridHandle.h>
 
 #include <nanovdb/tools/CreateNanoGrid.h>
+#include <nanovdb/tools/cuda/PointsToGrid.cuh>
 
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAMathCompat.h>
 
 #include <thrust/universal_vector.h>
+
+#include <limits>
 
 namespace fvdb {
 namespace detail {
@@ -27,6 +32,132 @@ template <torch::DeviceType>
 nanovdb::GridHandle<TorchDeviceBuffer>
 dispatchBuildGridFromPoints(const JaggedTensor &points,
                             const std::vector<VoxelCoordTransform> &txs);
+
+namespace {
+
+/// @brief Pointer-like adaptor that yields index-space voxel coordinates from world-space points
+///        on demand, so the coordinates never have to be materialized in memory.
+///
+/// `nanovdb::tools::cuda::voxelsToGrid` reads its input through a pointer-like type rather than a
+/// raw pointer (see `nanovdb::tools::cuda::fancy_ptr`, which documents the contract): `operator[]`
+/// is what the kernels actually call, and `operator*` exists only so `pointer_traits` can deduce
+/// `element_type` from its return type. Returning `nanovdb::Coord` by value satisfies both and
+/// selects the `is_same<Vec3T, Coord>` branch of `TileKeyFunctor` -- the same branch a raw
+/// `nanovdb::Coord *` takes -- so the resulting topology is bit-for-bit what a
+/// materialize-then-sort path produces.
+///
+/// Used by the single-member build, which keeps PointsToGrid (see dispatchBuildGridFromPoints):
+/// there the adaptor saves the 12 B per point that the multi-member path materializes.
+///
+/// The class supports both memory layouts of an (N, 3) tensor so that non-contiguous views --
+/// e.g. the xyz columns of an (N, 6) point cloud, `cloud[:, :3]` -- are read in place rather
+/// than copied. `IsContiguous` selects between compile-time strides (3, 1) and runtime strides
+/// taken from the tensor, so the packed fast path pays nothing for the generality.
+///
+/// @tparam ScalarT Scalar type of the input points (floating point or half)
+/// @tparam IsContiguous Whether the points are a packed (N, 3) array; when false, element
+///         strides are supplied at construction
+template <typename ScalarT, bool IsContiguous> class TransformedPointPtr {
+  public:
+    using MathT = typename at::opmath_type<ScalarT>;
+
+    /// @param points Pointer to the first component of the first point
+    /// @param transform World-space to index-space transform for this batch item
+    /// @param rowStride Distance in elements between consecutive points (3 if packed)
+    /// @param colStride Distance in elements between a point's components (1 if packed)
+    __hostdev__
+    TransformedPointPtr(const ScalarT *points,
+                        const VoxelCoordTransform &transform,
+                        int64_t rowStride = 3,
+                        int64_t colStride = 1)
+        : mPoints(points), mTransform(transform), mRowStride(rowStride), mColStride(colStride) {}
+
+    /// @brief Return the index-space voxel coordinate of the i'th point. Required by PointsToGrid.
+    __hostdev__ inline nanovdb::Coord
+    operator[](size_t i) const {
+        MathT x, y, z;
+        if constexpr (IsContiguous) {
+            const ScalarT *point = mPoints + 3 * i;
+            x                    = static_cast<MathT>(point[0]);
+            y                    = static_cast<MathT>(point[1]);
+            z                    = static_cast<MathT>(point[2]);
+        } else {
+            const ScalarT *point = mPoints + static_cast<int64_t>(i) * mRowStride;
+            x                    = static_cast<MathT>(point[0]);
+            y                    = static_cast<MathT>(point[mColStride]);
+            z                    = static_cast<MathT>(point[2 * mColStride]);
+        }
+        return mTransform.apply(x, y, z).round();
+    }
+
+    /// @brief Required by `pointer_traits` to deduce `element_type` -- only the return *type* is
+    ///        used. Deliberately does not read `mPoints`: `pointer_traits` never evaluates this,
+    ///        and returning a default coordinate keeps it well defined for an empty point set if
+    ///        some future code path (or debug instrumentation) ever does evaluate it.
+    __hostdev__ inline nanovdb::Coord
+    operator*() const {
+        return nanovdb::Coord();
+    }
+
+  private:
+    const ScalarT *mPoints;
+    VoxelCoordTransform mTransform;
+    int64_t mRowStride;
+    int64_t mColStride;
+};
+
+/// Single-member from_points: NanoVDB's PointsToGrid over the transformed-point adaptor, reading
+/// the points in place. Kept for B == 1 because the batched path gains almost nothing in time
+/// there while materializing coordinates and holding more scratch per point.
+nanovdb::GridHandle<TorchDeviceBuffer>
+pointsToGridSingle(const JaggedTensor &points, const VoxelCoordTransform &tx) {
+    using GridT = nanovdb::ValueOnIndex;
+
+    // The guide buffer carries the device (with index) into TorchDeviceBuffer::create.
+    TorchDeviceBuffer guide(0, points.device());
+
+    const torch::Tensor pointsData = points.jdata();
+    const int64_t nPoints          = pointsData.size(0);
+    // PointsToGrid casts its element count to int for the segmented radix sort, so anything at or
+    // above 2^31 would silently produce a corrupt grid.
+    TORCH_CHECK(nPoints <= std::numeric_limits<int32_t>::max(),
+                "Cannot build a grid from ",
+                nPoints,
+                " points in a single batch item (limit is ",
+                std::numeric_limits<int32_t>::max(),
+                ")");
+    if (nPoints == 0) {
+        return createEmptyGridHandle(points.device());
+    }
+
+    return AT_DISPATCH_V2(
+        points.scalar_type(),
+        "buildGridFromPoints",
+        AT_WRAP([&]() -> nanovdb::GridHandle<TorchDeviceBuffer> {
+            const scalar_t *pointsPtr = pointsData.data_ptr<scalar_t>();
+            nanovdb::GridHandle<TorchDeviceBuffer> handle;
+            if (pointsData.is_contiguous()) {
+                using PointPtrT = TransformedPointPtr<scalar_t, true>;
+                handle          = nanovdb::tools::cuda::
+                    voxelsToGrid<GridT, PointPtrT, TorchDeviceBuffer, BuilderResource>(
+                        PointPtrT(pointsPtr, tx), nPoints, 1.0, guide);
+            } else {
+                using PointPtrT = TransformedPointPtr<scalar_t, false>;
+                handle          = nanovdb::tools::cuda::
+                    voxelsToGrid<GridT, PointPtrT, TorchDeviceBuffer, BuilderResource>(
+                        PointPtrT(pointsPtr, tx, pointsData.stride(0), pointsData.stride(1)),
+                        nPoints,
+                        1.0,
+                        guide);
+            }
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            return handle;
+        }),
+        AT_EXPAND(AT_FLOATING_TYPES),
+        c10::kHalf);
+}
+
+} // namespace
 
 template <typename ScalarT>
 __device__ void
@@ -63,10 +194,14 @@ dispatchBuildGridFromPoints<torch::kCUDA>(const JaggedTensor &points,
 
     c10::cuda::CUDAGuard deviceGuard(points.device());
 
-    // Materialize the rounded index-space coordinate of every point (12 B per point) and build
-    // the whole batch in one batched from_ijk pass (issue #775). This replaces a per-member
-    // PointsToGrid loop over a transformed-point adaptor plus mergeGridHandles: one stream
-    // synchronization for the whole batch instead of several per member.
+    if (points.num_outer_lists() == 1) {
+        return pointsToGridSingle(points, txs[0]);
+    }
+
+    // Multi-member: materialize the rounded index-space coordinate of every point (12 B per
+    // point) and build the whole batch in one batched from_ijk pass (issue #775). This replaces a
+    // per-member PointsToGrid loop over the transformed-point adaptor plus mergeGridHandles: one
+    // stream synchronization for the whole batch instead of several per member.
     const torch::TensorOptions ijkOptions =
         torch::TensorOptions().dtype(torch::kInt32).device(points.device());
     torch::Tensor ijk = torch::empty({points.jdata().size(0), 3}, ijkOptions);
