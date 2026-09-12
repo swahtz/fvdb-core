@@ -5,8 +5,9 @@
 
 On CUDA, ``refined_grid`` / ``coarsened_grid`` (and through them ``conv_grid`` /
 ``conv_transpose_grid`` for K == S), and ``from_ijk`` (and through it ``from_points``,
-``from_mesh``, ``from_nearest_voxels_to_points`` and the non-power-of-two ``conv_grid`` fallback)
-build all batch members in a single batched pass instead of one NanoVDB build + merge per member.
+``from_mesh``, ``from_nearest_voxels_to_points`` and the non-power-of-two ``conv_grid`` fallback),
+and ``merged_grid`` (Union of two batches) build all batch members in a single batched pass instead
+of one NanoVDB build + merge per member.
 These tests pin the batched results against:
 
 - ``from_ijk`` (PointsToGrid) grids built from independently computed expected coordinates,
@@ -163,6 +164,55 @@ def _from_ijk_batches():
         }
     )
     return batches
+
+
+def _expected_union_ijk(ijk_a: torch.Tensor, ijk_b: torch.Tensor) -> torch.Tensor:
+    """Unique coordinates of the union of the two coordinate sets."""
+    both = torch.cat([ijk_a.reshape(-1, 3), ijk_b.reshape(-1, 3)]).to(torch.int64)
+    if both.numel() == 0:
+        return both.reshape(0, 3).to(torch.int32)
+    return torch.unique(both, dim=0).to(torch.int32)
+
+
+# Pairs (coords_a, coords_b) of coordinate batches for merged_grid (the Union pass): every tricky
+# batch unioned with a shifted copy of itself (partial overlap, leaves straddled) and with a
+# permuted copy (identical sets, every leaf coincident on both sides), plus hand-built disjoint,
+# identical, partially overlapping and one-side-empty pairs.
+def _merge_pairs():
+    base = _tricky_batches()
+    torch.manual_seed(11)
+    pairs = {}
+    shift = torch.tensor([3, -2, 5], dtype=torch.int32)
+    for name, coords in base.items():
+        pairs[f"{name}_shifted"] = (coords, [c + shift for c in coords])
+        pairs[f"{name}_permuted"] = (coords, [c[torch.randperm(c.shape[0])] for c in coords])
+    pairs["disjoint"] = (
+        [torch.randint(-16, 0, (300, 3), dtype=torch.int32), torch.randint(0, 16, (200, 3), dtype=torch.int32)],
+        [torch.randint(16, 32, (250, 3), dtype=torch.int32), torch.randint(-40, -20, (150, 3), dtype=torch.int32)],
+    )
+    identical = [torch.randint(-20, 20, (400, 3), dtype=torch.int32), torch.tensor([[1, 2, 3]], dtype=torch.int32)]
+    pairs["identical"] = (identical, [c.clone() for c in identical])
+    pairs["partial_overlap"] = (
+        [torch.randint(0, 12, (500, 3), dtype=torch.int32), torch.randint(-4100, -4090, (400, 3), dtype=torch.int32)],
+        [torch.randint(6, 18, (500, 3), dtype=torch.int32), torch.randint(-4096, -4086, (400, 3), dtype=torch.int32)],
+    )
+    pairs["one_side_empty"] = (
+        [
+            torch.empty((0, 3), dtype=torch.int32),
+            torch.randint(-10, 10, (100, 3), dtype=torch.int32),
+            torch.empty((0, 3), dtype=torch.int32),
+            torch.randint(0, 30, (200, 3), dtype=torch.int32),
+            torch.empty((0, 3), dtype=torch.int32),
+        ],
+        [
+            torch.randint(-10, 10, (100, 3), dtype=torch.int32),
+            torch.empty((0, 3), dtype=torch.int32),
+            torch.empty((0, 3), dtype=torch.int32),
+            torch.randint(20, 50, (200, 3), dtype=torch.int32),
+            torch.tensor([[7, 7, 7]], dtype=torch.int32),
+        ],
+    )
+    return pairs
 
 
 # Canonical NanoVDB voxel enumeration order (root tiles by offset-shifted sort key, then x-major
@@ -360,6 +410,49 @@ class TestBatchedTopologyBuilder(unittest.TestCase):
                 self._check_multi_member_equals_per_member(pair, singles[b : b + 2], f"from_points {layout} pair {b}")
             cpu = GridBatch.from_points(JaggedTensor([pts[0]]), voxel_sizes=0.1, origins=0.0)
             self._check_against_cpu(singles[0], cpu, f"from_points {layout} B=1 vs CPU")
+
+    @parameterized.expand([(name,) for name in _merge_pairs().keys()])
+    def test_merged_grid_matches_expected_and_cpu(self, name):
+        coords_a, coords_b = _merge_pairs()[name]
+        grid_a = _build(coords_a, "cuda")
+        grid_b = _build(coords_b, "cuda")
+        result = grid_a.merged_grid(grid_b)
+        expected = [_expected_union_ijk(a, b) for a, b in zip(coords_a, coords_b)]
+        self._check_against_expected(result, expected, f"{name} merged_grid")
+        cpu_result = _build(coords_a, "cpu").merged_grid(_build(coords_b, "cpu"))
+        self._check_against_cpu(result, cpu_result, f"{name} merged_grid vs CPU")
+        # Union is symmetric, including the canonical enumeration order.
+        swapped = grid_b.merged_grid(grid_a)
+        self.assertTrue(torch.equal(swapped.ijk.jdata, result.ijk.jdata), f"{name} merged_grid symmetry")
+        self.assertTrue(torch.equal(swapped.num_voxels, result.num_voxels), f"{name} merged_grid symmetry counts")
+        # Voxel sizes / origins come from the first operand.
+        self.assertTrue(torch.equal(result.voxel_sizes, grid_a.voxel_sizes), f"{name} merged_grid voxel sizes")
+        self.assertTrue(torch.equal(result.origins, grid_a.origins), f"{name} merged_grid origins")
+
+    def test_merged_grid_on_sliced_views(self):
+        torch.manual_seed(5)
+        coords_a = [
+            torch.tensor([[0, 0, 0]], dtype=torch.int32),
+            torch.randint(-8, 8, (200, 3), dtype=torch.int32),
+            torch.empty((0, 3), dtype=torch.int32),
+            torch.randint(30, 50, (150, 3), dtype=torch.int32),
+        ]
+        coords_b = [
+            torch.randint(-3, 3, (40, 3), dtype=torch.int32),
+            torch.randint(0, 12, (200, 3), dtype=torch.int32),
+            torch.tensor([[5, 5, 5]], dtype=torch.int32),
+            torch.empty((0, 3), dtype=torch.int32),
+        ]
+        full_a = _build(coords_a, "cuda")
+        full_b = _build(coords_b, "cuda")
+        for sel, idx in ((slice(1, 3), [1, 2]), ([0, 2, 3], [0, 2, 3]), (slice(0, 4, 2), [0, 2])):
+            view_result = full_a[sel].merged_grid(full_b[sel])
+            expected = [_expected_union_ijk(coords_a[i], coords_b[i]) for i in idx]
+            self._check_against_expected(view_result, expected, f"merged_grid on sliced view {sel}")
+            contiguous = _build([coords_a[i] for i in idx], "cuda").merged_grid(
+                _build([coords_b[i] for i in idx], "cuda")
+            )
+            self.assertTrue(torch.equal(view_result.ijk.jdata, contiguous.ijk.jdata), f"view {sel} vs contiguous")
 
     def _check_multi_member_equals_per_member(self, multi: GridBatch, singles, msg: str):
         self.assertEqual(multi.grid_count, len(singles), msg)

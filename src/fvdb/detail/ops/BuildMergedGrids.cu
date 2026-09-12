@@ -1,19 +1,18 @@
 // Copyright Contributors to the OpenVDB Project
 // SPDX-License-Identifier: Apache-2.0
 //
-#include <fvdb/BuilderResource.h>
 #include <fvdb/TorchDeviceBuffer.h>
 #include <fvdb/detail/GridBatchDataFactory.h>
 #include <fvdb/detail/ops/BuildMergedGrids.h>
 #include <fvdb/detail/utils/Utils.h>
+#include <fvdb/detail/utils/nanovdb/BatchedTopologyBuilder.cuh>
 
 #include <nanovdb/NanoVDB.h>
 #include <nanovdb/tools/CreateNanoGrid.h>
 #include <nanovdb/tools/GridBuilder.h>
-#include <nanovdb/tools/cuda/MergeGrids.cuh>
-#include <nanovdb/util/MorphologyHelpers.h>
 
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 
 namespace fvdb::detail::ops {
 
@@ -32,39 +31,17 @@ dispatchMergeGrids<torch::kCUDA>(const GridBatchData &gridBatch1, const GridBatc
 
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream(gridBatch1.device().index());
 
-    // This guide buffer is a hack to pass in a device with an index to the cudaCreateNanoGrid
-    // function. We can't pass in a device directly but we can pass in a buffer which gets
-    // passed to TorchDeviceBuffer::create. The guide buffer holds the device and effectively
-    // passes it to the created buffer.
-    TorchDeviceBuffer guide(0, gridBatch1.device());
-
-    // Create a grid for each batch item and store the handles
-    std::vector<nanovdb::GridHandle<TorchDeviceBuffer>> handles;
-    for (int i = 0; i < gridBatch1.batchSize(); i += 1) {
-        nanovdb::OnIndexGrid *grid1 = gridBatch1.mGridHdl->deviceGrid<nanovdb::ValueOnIndex>(i);
-        TORCH_CHECK(grid1, "First Grid is null");
-        nanovdb::OnIndexGrid *grid2 = gridBatch2.mGridHdl->deviceGrid<nanovdb::ValueOnIndex>(i);
-        TORCH_CHECK(grid2, "Second Grid is null");
-
-        nanovdb::tools::cuda::MergeGrids<nanovdb::ValueOnIndex, BuilderResource> mergeOp(
-            grid1, grid2, stream);
-        mergeOp.setChecksum(nanovdb::CheckMode::Default);
-        mergeOp.setVerbose(0);
-
-        auto handle = mergeOp.getHandle(guide);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-        handles.push_back(std::move(handle));
-    }
-
-    if (handles.size() == 1) {
-        // If there's only one handle, just return it
-        return std::move(handles[0]);
-    } else {
-        // This copies all the handles into a single handle -- only do it if there are multiple
-        // grids
-        return nanovdb::cuda::mergeGridHandles(handles, &guide);
-    }
+    // All batch members are merged together in one batched Union pass: every leaf of either
+    // source batch is an emission slot carrying its origin and activity mask, coincident leaves
+    // OR-combine in the dedup stage, a single output buffer, one stream synchronization -- no
+    // per-member nanovdb::tools::cuda::MergeGrids builds or handle merging (issue #775). Members
+    // empty on one side pass the other side through; members empty on both sides become valid
+    // empty grids inline. The output headers are seeded from the first batch.
+    batched::BatchedTopologyResult result =
+        batched::runBatchedTopologyPass(batched::sourceFromGridBatchPair(gridBatch1, gridBatch2),
+                                        batched::TopologyPassSpec::unionOf(),
+                                        stream);
+    return nanovdb::GridHandle<TorchDeviceBuffer>(std::move(result.buffer));
 }
 
 template <>

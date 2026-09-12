@@ -11,12 +11,14 @@
 // workloads that rebuild grids every training iteration (issue #755), that per-member fixed
 // overhead -- not the topology size -- dominates wall clock and serializes the GPU.
 //
-// This header rebuilds the factor-2 refine (subdivision) and coarsen passes, box dilation, and
-// coordinate-list construction (from_ijk) so one invocation covers the whole batch:
+// This header rebuilds the factor-2 refine (subdivision) and coarsen passes, box dilation,
+// coordinate-list construction (from_ijk) and the two-batch union (merged_grid) so one invocation
+// covers the whole batch:
 //
-//   emit    one kernel over all emission slots of all members (source leaves, or coordinates for
-//           the Coords pass) emits candidate output leaves as (root-tile sort key, in-tile node
-//           key, leaf origin, 512-bit activity mask) slots, segmented per grid;
+//   emit    one kernel over all emission slots of all members (source leaves, coordinates for
+//           the Coords pass, or the leaves of both source batches for Union) emits candidate
+//           output leaves as (root-tile sort key, in-tile node key, leaf origin, 512-bit activity
+//           mask) slots, segmented per grid;
 //   sort    stable global radix sorts (node key, then tile key, then grid index) put each grid's
 //           slots in canonical NanoVDB node order (root tiles by the PointsToGrid offset-shifted
 //           key, then upper/lower child offsets); invalid slots sort to the segment tails;
@@ -26,7 +28,7 @@
 //           are computed on the host and a single output buffer is allocated, together with the
 //           unique-node-sized tables (head slot, parent linkage, per-leaf 512-bit masks) into
 //           which every slot's mask contribution is reduced (non-injective passes -- coarsen,
-//           dilate, coords -- OR-combine duplicate producers here);
+//           dilate, coords, union -- OR-combine duplicate producers here);
 //   build   batched kernels write every grid's GridData/TreeData/RootData (mGridIndex = g,
 //           mGridCount = B), root tiles, upper/lower/leaf nodes, leaf mOffset/mPrefixSum, and
 //           bounding boxes. Empty members become valid empty grids inline (no host proxy grids).
@@ -81,8 +83,11 @@ using LeafT  = nanovdb::NanoLeaf<BuildT>;
 /// boxes compose from multiple passes (Minkowski sums by boxes compose). `Coords` builds the
 /// batch from a jagged voxel-coordinate list (from_ijk): it has no source grids, one emission
 /// slot per coordinate, and its per-grid slot counts come from `BatchedTopologySource::slotCounts`.
+/// `Union` is the member-wise topology union of two batches (merged_grid): the source's `grids`
+/// is batch A and `gridsB` is batch B, slot = one leaf of A followed by the leaves of B
+/// (`slotCounts[g] = leafCounts[g] + leafCountsB[g]`), and coincident leaves OR-combine.
 struct TopologyPassSpec {
-    enum class Op { Refine, Coarsen, BoxDilate, Coords };
+    enum class Op { Refine, Coarsen, BoxDilate, Coords, Union };
     Op op;
     nanovdb::Coord boxLo{0}, boxHi{0}; // BoxDilate only
     // Coords only: device pointers to the N x 3 contiguous int32 coordinates and to the B+1
@@ -109,6 +114,10 @@ struct TopologyPassSpec {
         spec.offsets = offsets;
         return spec;
     }
+    static TopologyPassSpec
+    unionOf() {
+        return {Op::Union};
+    }
 };
 
 /// True for passes in which several emission slots may target the same output leaf, so the
@@ -119,7 +128,8 @@ passHasDuplicateProducers(TopologyPassSpec::Op op) {
     case TopologyPassSpec::Op::Refine: return false;
     case TopologyPassSpec::Op::Coarsen:
     case TopologyPassSpec::Op::BoxDilate:
-    case TopologyPassSpec::Op::Coords: return true;
+    case TopologyPassSpec::Op::Coords:
+    case TopologyPassSpec::Op::Union: return true;
     }
     return true;
 }
@@ -137,10 +147,17 @@ passHasDuplicateProducers(TopologyPassSpec::Op op) {
 /// Source grids are optional for passes that do not read them (Coords). With `grids` empty the
 /// batch size is `slotCounts.size()` and every output header is initialized to the default
 /// ValueOnIndex header (identity map, IndexGrid class) instead of being copied from a source grid.
+///
+/// The Union pass reads a second batch of the same size through `gridsB` / `leafCountsB`; `grids`
+/// is batch A and seeds the output headers. Slot g-local index i < leafCounts[g] addresses leaf i
+/// of A[g], otherwise leaf i - leafCounts[g] of B[g] (`slotCounts[g] = leafCounts[g] +
+/// leafCountsB[g]`, see `sourceFromGridBatchPair`). Other passes ignore both fields.
 struct BatchedTopologySource {
-    std::vector<const GridT *> grids; // per-member device grid pointers (host-side vector)
-    std::vector<int64_t> leafCounts;  // per-member leaf counts (host-side)
-    std::vector<int64_t> slotCounts;  // optional per-member emission slot counts (host-side)
+    std::vector<const GridT *> grids;  // per-member device grid pointers (host-side vector)
+    std::vector<int64_t> leafCounts;   // per-member leaf counts (host-side)
+    std::vector<int64_t> slotCounts;   // optional per-member emission slot counts (host-side)
+    std::vector<const GridT *> gridsB; // Union only: per-member device grid pointers of batch B
+    std::vector<int64_t> leafCountsB;  // Union only: per-member leaf counts of batch B
     torch::Device device{torch::kCUDA};
 };
 
@@ -500,6 +517,41 @@ emitCoordLeaves(EmissionArrays em,
         em.origin[originIndex(s)]     = c[0];
         em.origin[originIndex(s) + 1] = c[1];
         em.origin[originIndex(s) + 2] = c[2];
+    }
+}
+
+/// Union: slot = one leaf of either source batch. Grid g's segment holds the leafCountsA[g]
+/// leaves of A[g] followed by the leaves of B[g]; each slot copies its leaf's origin and full
+/// 512-bit activity mask unchanged. A leaf present in both A[g] and B[g] yields two slots with the
+/// same node key, which reduceLeafMasks OR-combines; leaves unique to one side pass through.
+static __global__ void
+emitUnionLeaves(EmissionArrays em,
+                const GridT *const *__restrict__ srcGridsB,
+                const int32_t *__restrict__ leafCountsA) {
+    for (int32_t s = blockIdx.x * blockDim.x + threadIdx.x; s < em.numSlots;
+         s += gridDim.x * blockDim.x) {
+        const int32_t g         = findSegment(em.segOffsets, em.numSegments, s);
+        const int32_t localSlot = s - em.segOffsets[g];
+        const int32_t numA      = leafCountsA[g];
+        const LeafT &srcLeaf =
+            localSlot < numA ? em.srcGrids[g]->tree().template getFirstNode<0>()[localSlot]
+                             : srcGridsB[g]->tree().template getFirstNode<0>()[localSlot - numA];
+        if (srcLeaf.valueMask().isOff()) { // leaves always have active voxels; defensive
+            em.tileKey[s] = kInvalidTileKey;
+            em.nodeKey[s] = 0;             // sort pass 1 reads every slot's node key
+            continue;
+        }
+
+        const nanovdb::Coord origin   = srcLeaf.origin();
+        em.tileKey[s]                 = tileSortKey(origin);
+        em.nodeKey[s]                 = nodeSortKey(origin);
+        em.origin[originIndex(s)]     = origin[0];
+        em.origin[originIndex(s) + 1] = origin[1];
+        em.origin[originIndex(s) + 2] = origin[2];
+        const uint64_t *srcWords      = srcLeaf.valueMask().words();
+        for (int i = 0; i < 8; ++i) {
+            em.mask[maskIndex(s) + i] = srcWords[i];
+        }
     }
 }
 
@@ -1012,6 +1064,28 @@ sourceFromCoordCounts(const std::vector<int64_t> &coordCounts, const torch::Devi
     return src;
 }
 
+/// Source for a Union pass over two batches of the same size on the same device: `grids` /
+/// `leafCounts` come from `batchA` (which also seeds the output headers), `gridsB` / `leafCountsB`
+/// from `batchB`, and every member emits one slot per leaf of either side.
+inline BatchedTopologySource
+sourceFromGridBatchPair(const GridBatchData &batchA, const GridBatchData &batchB) {
+    TORCH_CHECK_VALUE(batchA.batchSize() == batchB.batchSize(),
+                      "batched Union pass: the two batches must have the same batch size");
+    TORCH_CHECK_VALUE(batchA.device() == batchB.device(),
+                      "batched Union pass: the two batches must be on the same device");
+    BatchedTopologySource src = sourceFromGridBatch(batchA);
+    const int64_t batchSize   = batchB.batchSize();
+    src.gridsB.reserve(batchSize);
+    src.leafCountsB.reserve(batchSize);
+    src.slotCounts.reserve(batchSize);
+    for (int64_t i = 0; i < batchSize; ++i) {
+        src.gridsB.push_back(batchB.deviceGridPtrAt(i));
+        src.leafCountsB.push_back(batchB.numLeavesAt(i));
+        src.slotCounts.push_back(src.leafCounts[i] + src.leafCountsB[i]);
+    }
+    return src;
+}
+
 /// Runs one batched topology pass over all grids of `src`.
 /// One cudaStreamSynchronize total (the node-count readback that sizes the output allocation).
 inline BatchedTopologyResult
@@ -1042,6 +1116,17 @@ runBatchedTopologyPass(const BatchedTopologySource &src,
         TORCH_CHECK(pass.offsets != nullptr, "Coords pass requires the jagged offsets pointer");
         TORCH_CHECK(!src.slotCounts.empty(),
                     "Coords pass requires per-grid slot counts (coordinates per grid)");
+        break;
+    case TopologyPassSpec::Op::Union:
+        TORCH_CHECK(int32_t(src.gridsB.size()) == numGrids &&
+                        int32_t(src.leafCountsB.size()) == numGrids,
+                    "Union pass requires a second batch (gridsB / leafCountsB) of the same size");
+        TORCH_CHECK(!src.slotCounts.empty(),
+                    "Union pass requires per-grid slot counts (leafCounts + leafCountsB)");
+        for (int32_t g = 0; g < numGrids; ++g) {
+            TORCH_CHECK(src.slotCounts[g] == src.leafCounts[g] + src.leafCountsB[g],
+                        "Union pass: slotCounts[g] must equal leafCounts[g] + leafCountsB[g]");
+        }
         break;
     }
 
@@ -1104,6 +1189,28 @@ runBatchedTopologyPass(const BatchedTopologySource &src,
                                        cudaMemcpyHostToDevice,
                                        stream));
     }
+    // Union only: batch B's grid pointers and batch A's per-grid leaf counts (the split point of
+    // each segment between A's and B's slots).
+    const bool isUnion           = pass.op == TopologyPassSpec::Op::Union;
+    torch::Tensor srcGridsBDev   = torch::empty({isUnion ? numGrids : 0}, i64Opts);
+    torch::Tensor leafCountsADev = torch::empty({isUnion ? numGrids : 0}, i32Opts);
+    std::vector<int32_t> leafCountsAHost;
+    if (isUnion) {
+        leafCountsAHost.resize(numGrids);
+        for (int32_t g = 0; g < numGrids; ++g) {
+            leafCountsAHost[g] = int32_t(src.leafCounts[g]);
+        }
+        C10_CUDA_CHECK(cudaMemcpyAsync(srcGridsBDev.data_ptr<int64_t>(),
+                                       src.gridsB.data(),
+                                       sizeof(const GridT *) * numGrids,
+                                       cudaMemcpyHostToDevice,
+                                       stream));
+        C10_CUDA_CHECK(cudaMemcpyAsync(leafCountsADev.data_ptr<int32_t>(),
+                                       leafCountsAHost.data(),
+                                       sizeof(int32_t) * numGrids,
+                                       cudaMemcpyHostToDevice,
+                                       stream));
+    }
 
     // --- Emit candidate output leaves. Scratch tensors are released (reassigned to an empty
     // tensor) as soon as the last consumer has been enqueued; the caching allocator only reuses
@@ -1141,6 +1248,12 @@ runBatchedTopologyPass(const BatchedTopologySource &src,
         case TopologyPassSpec::Op::Coords:
             emitCoordLeaves<<<numBlocks(numSlots), kThreads, 0, stream>>>(
                 em, pass.ijk, pass.offsets);
+            break;
+        case TopologyPassSpec::Op::Union:
+            emitUnionLeaves<<<numBlocks(numSlots), kThreads, 0, stream>>>(
+                em,
+                reinterpret_cast<const GridT *const *>(srcGridsBDev.data_ptr<int64_t>()),
+                leafCountsADev.data_ptr<int32_t>());
             break;
         }
         C10_CUDA_KERNEL_LAUNCH_CHECK();
