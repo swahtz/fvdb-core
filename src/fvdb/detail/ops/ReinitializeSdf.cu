@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 
 namespace fvdb {
 namespace detail {
@@ -89,9 +90,15 @@ faceValue(const ScalarT *field, uint64_t index, ScalarT signSource, ScalarT band
                   zp = faceValue<ScalarT>(field, faceIndex[5], signSource, bandWidth)
 
 // =====================  fused stencil kernels ====================================================
-// frozen Peng smoothed sign from a field's value + central-difference gradient. An exactly-0 centre
-// yields sign 0, so the Godunov RHS vanishes there and such (no-data) voxels are never moved by the
-// redistance; the ray-implicit-intersection op relies on exact 0 surviving as a gap marker.
+// Frozen Peng smoothed sign from a field's value + central-difference gradient, plus the
+// Russo-Smereka interface data: a voxel whose value changes sign across an active face is an
+// interface cell, and `interfaceDist` holds its signed distance to the zero crossing estimated
+// from the largest one-sided slope of the initial field across its active faces. Godunov updates at
+// interface cells are replaced by a relaxation toward that distance, which anchors the zero
+// crossing; without it the pure Godunov scheme has no steady state on features 1-3 voxels thick and
+// erodes them a little more with every iteration. An exactly-0 centre yields sign 0 and distance 0,
+// so the RHS vanishes there and such (no-data) voxels are never moved by the redistance; the
+// ray-implicit-intersection op relies on exact 0 surviving as a gap marker.
 template <typename ScalarT>
 __global__ void
 signFusedKernel(const OnIndexGridT *grid,
@@ -101,7 +108,9 @@ signFusedKernel(const OnIndexGridT *grid,
                 const ScalarT *field,
                 ScalarT voxelSize,
                 ScalarT bandWidth,
-                ScalarT *sign) {
+                ScalarT *sign,
+                ScalarT *interfaceDist,
+                uint8_t *interfaceMask) {
     VBM_FACES_BEGIN();
     const ScalarT phiCenter = field[centerIndex];
     VBM_FACE_VALUES(field, phiCenter, bandWidth);
@@ -113,6 +122,28 @@ signFusedKernel(const OnIndexGridT *grid,
                                         (gradX * gradX + gradY * gradY + gradZ * gradZ) *
                                             voxelSize * voxelSize +
                                         ScalarT(1e-12));
+
+    // Inactive faces read with the centre's sign, so they never form an interface.
+    const bool centerNeg   = phiCenter < ScalarT(0);
+    const bool isInterface = ((xm < ScalarT(0)) != centerNeg) || ((xp < ScalarT(0)) != centerNeg) ||
+                             ((ym < ScalarT(0)) != centerNeg) || ((yp < ScalarT(0)) != centerNeg) ||
+                             ((zm < ScalarT(0)) != centerNeg) || ((zp < ScalarT(0)) != centerNeg);
+    interfaceMask[centerIndex] = isInterface ? 1 : 0;
+    if (isInterface) {
+        // Largest one-sided slope over ACTIVE faces only. An inactive face reads as +/-bandWidth
+        // and would inflate the slope, pulling a band-edge interface cell toward zero. The central
+        // difference is bounded by the larger one-sided difference, so it adds nothing.
+        using nanovdb::math::Abs;
+        using nanovdb::math::Max;
+        const ScalarT faceVals[6] = {xm, xp, ym, yp, zm, zp};
+        ScalarT slope             = ScalarT(1e-6) * voxelSize;
+        for (int k = 0; k < 6; ++k)
+            if (faceIndex[k])
+                slope = Max(slope, Abs(faceVals[k] - phiCenter));
+        interfaceDist[centerIndex] = voxelSize * phiCenter / slope;
+    } else {
+        interfaceDist[centerIndex] = ScalarT(0);
+    }
 }
 
 // One-sided upwind selection of the squared one-dimensional derivative for the Godunov scheme.
@@ -130,7 +161,9 @@ upwind(ScalarT backwardDiff, ScalarT forwardDiff, ScalarT sgn) {
     }
 }
 
-// Godunov RHS: d phi/dt = sign * (1 - |grad phi|), one-sided upwind on the 6 faces.
+// Godunov RHS: d phi/dt = sign * (1 - |grad phi|), one-sided upwind on the 6 faces. Interface
+// cells instead use the Russo-Smereka subcell update d phi/dt = -(sgn(phi0) |phi| - D) / dx, which
+// converges to |phi| = D and keeps the zero crossing where the initial field put it.
 template <typename ScalarT>
 __global__ void
 godunovFusedKernel(const OnIndexGridT *grid,
@@ -139,11 +172,20 @@ godunovFusedKernel(const OnIndexGridT *grid,
                    uint64_t firstOffset,
                    const ScalarT *field,
                    const ScalarT *sign,
+                   const ScalarT *interfaceDist,
+                   const uint8_t *interfaceMask,
                    ScalarT voxelSize,
                    ScalarT bandWidth,
                    ScalarT *rhs) {
     VBM_FACES_BEGIN();
     const ScalarT center = field[centerIndex], sgn = sign[centerIndex];
+    if (interfaceMask[centerIndex]) {
+        const ScalarT sgn0 =
+            sgn > ScalarT(0) ? ScalarT(1) : (sgn < ScalarT(0) ? ScalarT(-1) : ScalarT(0));
+        rhs[centerIndex] =
+            -(sgn0 * nanovdb::math::Abs(center) - interfaceDist[centerIndex]) / voxelSize;
+        return;
+    }
     // Match upwind's frozen sign even if an RK stage crosses zero. For clamped stage values,
     // inactive faces then remain downwind instead of introducing a spurious boundary slope.
     VBM_FACE_VALUES(field, sgn, bandWidth);
@@ -256,6 +298,8 @@ runReinit(OnIndexGridT *grid,
           const VBMHelper &vbm,
           ScalarT *phi,
           ScalarT *sign,
+          ScalarT *interfaceDist,
+          uint8_t *interfaceMask,
           ScalarT *phiBase,
           ScalarT *stage,
           ScalarT *rhs0,
@@ -278,15 +322,32 @@ runReinit(OnIndexGridT *grid,
 
     auto godunov = [&](const ScalarT *field, ScalarT *out) {
         if (blockCount) {
-            godunovFusedKernel<ScalarT><<<blockCount, blockWidth, 0, stream>>>(
-                grid, firstLeafID, jumpMap, firstOffset, field, sign, voxelSize, bandWidth, out);
+            godunovFusedKernel<ScalarT><<<blockCount, blockWidth, 0, stream>>>(grid,
+                                                                               firstLeafID,
+                                                                               jumpMap,
+                                                                               firstOffset,
+                                                                               field,
+                                                                               sign,
+                                                                               interfaceDist,
+                                                                               interfaceMask,
+                                                                               voxelSize,
+                                                                               bandWidth,
+                                                                               out);
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
     };
     auto redistance = [&](int iters) {
         if (blockCount) {
-            signFusedKernel<ScalarT><<<blockCount, blockWidth, 0, stream>>>(
-                grid, firstLeafID, jumpMap, firstOffset, phi, voxelSize, bandWidth, sign);
+            signFusedKernel<ScalarT><<<blockCount, blockWidth, 0, stream>>>(grid,
+                                                                            firstLeafID,
+                                                                            jumpMap,
+                                                                            firstOffset,
+                                                                            phi,
+                                                                            voxelSize,
+                                                                            bandWidth,
+                                                                            sign,
+                                                                            interfaceDist,
+                                                                            interfaceMask);
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
         for (int it = 0; it < iters; ++it) {
@@ -422,16 +483,20 @@ reinitializeSdfCuda(const GridBatchData &batchHdl,
 
         torch::Tensor phiBuf     = torch::empty({valueCount}, opts);
         torch::Tensor signBuf    = torch::empty({valueCount}, opts);
+        torch::Tensor distBuf    = torch::empty({valueCount}, opts);
+        torch::Tensor maskBuf    = torch::zeros({valueCount}, opts.dtype(torch::kUInt8));
         torch::Tensor phiBaseBuf = torch::empty({valueCount}, opts);
         torch::Tensor stageBuf   = torch::empty({valueCount}, opts);
         torch::Tensor rhs0Buf    = torch::empty({valueCount}, opts);
-        torch::Tensor rhs1Buf = (order == 2) ? torch::empty({valueCount}, opts) : torch::Tensor();
-        ScalarT *phi          = phiBuf.data_ptr<ScalarT>();
-        ScalarT *sign         = signBuf.data_ptr<ScalarT>();
-        ScalarT *phiBase      = phiBaseBuf.data_ptr<ScalarT>();
-        ScalarT *stage        = stageBuf.data_ptr<ScalarT>();
-        ScalarT *rhs0         = rhs0Buf.data_ptr<ScalarT>();
-        ScalarT *rhs1         = (order == 2) ? rhs1Buf.data_ptr<ScalarT>() : nullptr;
+        torch::Tensor rhs1Buf  = (order == 2) ? torch::empty({valueCount}, opts) : torch::Tensor();
+        ScalarT *phi           = phiBuf.data_ptr<ScalarT>();
+        ScalarT *sign          = signBuf.data_ptr<ScalarT>();
+        ScalarT *interfaceDist = distBuf.data_ptr<ScalarT>();
+        uint8_t *interfaceMask = maskBuf.data_ptr<uint8_t>();
+        ScalarT *phiBase       = phiBaseBuf.data_ptr<ScalarT>();
+        ScalarT *stage         = stageBuf.data_ptr<ScalarT>();
+        ScalarT *rhs0          = rhs0Buf.data_ptr<ScalarT>();
+        ScalarT *rhs1          = (order == 2) ? rhs1Buf.data_ptr<ScalarT>() : nullptr;
 
         // gather: phi[1..] = field. Slot 0 of phi/stage is the background slot: filled with
         // bandWidth for hygiene but never read by the stencil kernels (see faceValue) nor written.
@@ -453,6 +518,8 @@ reinitializeSdfCuda(const GridBatchData &batchHdl,
                            vbm,
                            phi,
                            sign,
+                           interfaceDist,
+                           interfaceMask,
                            phiBase,
                            stage,
                            rhs0,
