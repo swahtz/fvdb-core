@@ -106,7 +106,10 @@ computeTileMask(const fvdb::JaggedRAcc64<CoordType, 2> pixelCoords,
                 const int32_t numTilesW,
                 const int32_t numTilesH,
                 fvdb::TorchRAcc64<bool, 1> outTileMask,
-                fvdb::TorchRAcc64<int64_t, 1> outTileIds) {
+                fvdb::TorchRAcc64<int64_t, 1> outTileIds,
+                int32_t *__restrict__ outOutOfBounds) {
+    const CoordType imageHeight = CoordType(numTilesH) * CoordType(tileSideLength);
+    const CoordType imageWidth  = CoordType(numTilesW) * CoordType(tileSideLength);
     for (auto pixelId = blockIdx.x * blockDim.x + threadIdx.x; pixelId < pixelCoords.elementCount();
          pixelId += blockDim.x * gridDim.x) {
         auto const batchId = pixelCoords.batchIdx(pixelId);
@@ -114,6 +117,14 @@ computeTileMask(const fvdb::JaggedRAcc64<CoordType, 2> pixelCoords,
         // Can't guarantee contiguity so can't do vectorized loads in general here
         const CoordType pixelRow = pixelCoords.data()[pixelId][0];
         const CoordType pixelCol = pixelCoords.data()[pixelId][1];
+
+        // Out-of-image pixels would index outTileMask past its end. Flag them and skip; the host
+        // raises after the sync it performs anyway.
+        if (pixelRow < 0 || pixelCol < 0 || pixelRow >= imageHeight || pixelCol >= imageWidth) {
+            *outOutOfBounds     = 1;
+            outTileIds[pixelId] = 0;
+            continue;
+        }
 
         const int32_t tileRow = pixelRow / tileSideLength;
         const int32_t tileCol = pixelCol / tileSideLength;
@@ -246,6 +257,7 @@ buildSparseGaussianTileLayout(const int32_t tileSideLength,
     // Compute a boolean tile
     torch::Tensor tileMask        = torch::zeros({numTilesW * numTilesH * numImages}, optionsBool);
     torch::Tensor perPixelTileIds = torch::empty({numPixels}, optionsInt64);
+    torch::Tensor outOfBounds     = torch::zeros({1}, optionsInt32);
 
     auto outMaskAccessor   = fvdb::tensorAccessor<torch::kCUDA, bool, 1>(tileMask);
     auto outTileIdAccessor = fvdb::tensorAccessor<torch::kCUDA, int64_t, 1>(perPixelTileIds);
@@ -258,7 +270,8 @@ buildSparseGaussianTileLayout(const int32_t tileSideLength,
             numTilesW,
             numTilesH,
             outMaskAccessor,
-            outTileIdAccessor);
+            outTileIdAccessor,
+            outOfBounds.data_ptr<int32_t>());
         C10_CUDA_KERNEL_LAUNCH_CHECK(); // TODO use our own error management
     });
 
@@ -298,10 +311,27 @@ buildSparseGaussianTileLayout(const int32_t tileSideLength,
                      uniqueCounts.data_ptr<int32_t>(),
                      numPixels,
                      stream);
+    // The sort key is (tileId << 32 | pixelIdInTile), unique per image pixel, so a duplicate pixel
+    // shows up as two equal adjacent keys. Read it back together with the flags in one copy.
+    torch::Tensor hasDuplicates =
+        (sortedPerPixelTileIds.slice(0, 1) == sortedPerPixelTileIds.slice(0, 0, -1))
+            .any()
+            .to(torch::kInt32)
+            .reshape({1});
     cudaStreamSynchronize(stream);
-    auto const numUniqueTiles = uniqueCounts.item<int32_t>();
-    uniqueTileIds             = uniqueTileIds.index({at::indexing::Slice(0, numUniqueTiles)});
-    numPixelsPerTile          = numPixelsPerTile.index({at::indexing::Slice(0, numUniqueTiles)});
+    auto const status         = torch::cat({uniqueCounts, outOfBounds, hasDuplicates}).cpu();
+    auto const statusAcc      = status.accessor<int32_t, 1>();
+    auto const numUniqueTiles = statusAcc[0];
+    TORCH_CHECK_VALUE(statusAcc[1] == 0,
+                      "pixelsToRender contains coordinates outside the ",
+                      numTilesH * tileSideLength,
+                      " x ",
+                      numTilesW * tileSideLength,
+                      " image");
+    TORCH_CHECK_VALUE(statusAcc[2] == 0,
+                      "pixelsToRender contains duplicate pixel coordinates within one image");
+    uniqueTileIds    = uniqueTileIds.index({at::indexing::Slice(0, numUniqueTiles)});
+    numPixelsPerTile = numPixelsPerTile.index({at::indexing::Slice(0, numUniqueTiles)});
 
     // Cumsum so we know where each tile starts in the sorted array
     FVDB_CUB_WRAPPER(cub::DeviceScan::InclusiveSum,

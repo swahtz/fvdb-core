@@ -16,7 +16,8 @@ Conventions shared by every function:
   and y grows downward.
 - ``pixels_to_render`` is a :class:`~fvdb.JaggedTensor` with one ``[P_c, 2]`` list of ``(row, col)``
   integer pixel coordinates per camera. A plain ``[C, P, 2]`` tensor is also accepted; 2-D tensors are
-  rejected because ``[P, 2]`` and ``[C, 2]`` cannot be told apart.
+  rejected because ``[P, 2]`` and ``[C, 2]`` cannot be told apart. Coordinates must lie inside the
+  image and be unique per camera; the layout kernel raises ``ValueError`` otherwise.
 - The sparse rasterization kernels are compiled for ``tile_size == 16``; the sparse wrappers reject
   any other value. Dense kernels accept any tile size.
 - Outputs the kernel does not produce for the given arguments come back as ``None``.
@@ -62,19 +63,23 @@ def _jagged_impl(value: JaggedTensor, name: str) -> "_fvdb_cpp.JaggedTensor":
 
 
 def _pixels_jagged(value: JaggedTensor | torch.Tensor) -> JaggedTensor:
-    """Normalize ``pixels_to_render`` to a JaggedTensor with one ``[P_c, 2]`` list per camera."""
-    if isinstance(value, JaggedTensor):
-        return value
+    """Normalize ``pixels_to_render`` to a JaggedTensor with one ``[P_c, 2]`` list per camera.
+
+    Only shapes and dtypes are checked here; coordinate bounds and uniqueness are checked by the
+    layout kernel at the synchronization it performs anyway.
+    """
     if isinstance(value, torch.Tensor):
-        if value.dim() == 3:
-            return JaggedTensor(list(value.unbind(0)))
-        raise ValueError(f"pixels_to_render tensor must have shape [C, P, 2], got {tuple(value.shape)}")
-    raise TypeError(f"pixels_to_render must be a fvdb.JaggedTensor or torch.Tensor, got {type(value).__name__}")
-
-
-def _pixels_impl(value: JaggedTensor | torch.Tensor) -> "_fvdb_cpp.JaggedTensor":
-    """C++ implementation object for ``pixels_to_render`` in either accepted form."""
-    return _pixels_jagged(value)._impl
+        if value.dim() != 3 or value.shape[0] == 0 or value.shape[2] != 2:
+            raise ValueError(f"pixels_to_render tensor must have shape [C, P, 2] with C > 0, got {tuple(value.shape)}")
+        value = JaggedTensor(list(value.unbind(0)))
+    elif not isinstance(value, JaggedTensor):
+        raise TypeError(f"pixels_to_render must be a fvdb.JaggedTensor or torch.Tensor, got {type(value).__name__}")
+    coords = value.jdata
+    if coords.dim() != 2 or coords.shape[1] != 2:
+        raise ValueError(f"pixels_to_render elements must be (row, col) pairs, got jdata shape {tuple(coords.shape)}")
+    if coords.dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"pixels_to_render must be int32 or int64, got {coords.dtype}")
+    return value
 
 
 def _empty_like_pixels(pixels: JaggedTensor, element_shape: tuple[int, ...], dtype: torch.dtype) -> JaggedTensor:
@@ -88,39 +93,27 @@ def _check_sparse_tile_size(tile_size: int) -> None:
         raise ValueError(f"sparse Gaussian rasterization requires tile_size == {_SPARSE_TILE_SIZE}, got {tile_size}")
 
 
-def _check_pixel_coordinates(pixels: JaggedTensor, tile_size: int, num_tiles_h: int, num_tiles_w: int) -> None:
-    """Validate pixel coordinates before the layout kernel indexes tile buffers with them.
+def _sparse_prologue(
+    tile_size: int,
+    pixels_to_render: JaggedTensor | torch.Tensor,
+    active_tiles: torch.Tensor,
+    pixel_map: torch.Tensor,
+) -> tuple[JaggedTensor, bool]:
+    """Shared entry checks for the sparse rasterization wrappers.
 
-    The kernel derives tile ids from the coordinates without bounds checks, and its pixel bookkeeping
-    assumes each pixel appears once per camera. Both are checked here with a single device
-    synchronization.
+    Returns the normalized pixel selection and whether the layout is empty. An empty layout must
+    come with an empty selection; otherwise the arguments disagree and the call is rejected rather
+    than silently returning zeros.
     """
-    if num_tiles_h <= 0 or num_tiles_w <= 0:
-        raise ValueError(f"num_tiles_h and num_tiles_w must be positive, got {num_tiles_h} and {num_tiles_w}")
-    coords = pixels.jdata
-    if coords.dim() != 2 or coords.shape[1] != 2:
-        raise ValueError(f"pixels_to_render elements must be (row, col) pairs, got jdata shape {tuple(coords.shape)}")
-    if coords.dtype not in (torch.int32, torch.int64):
-        raise TypeError(f"pixels_to_render must be int32 or int64, got {coords.dtype}")
-    if coords.numel() == 0:
-        return
-    height, width = num_tiles_h * tile_size, num_tiles_w * tile_size
-    lo, hi = torch.aminmax(coords, dim=0)
-    linear = (pixels.jidx.to(torch.int64) * height + coords[:, 0].to(torch.int64)) * width + coords[:, 1].to(
-        torch.int64
-    )
-    sorted_linear = torch.sort(linear).values
-    has_duplicates = (sorted_linear[1:] == sorted_linear[:-1]).any()
-    (min_row, min_col), (max_row, max_col), (duplicates, _) = torch.stack(
-        [lo, hi, torch.stack([has_duplicates, has_duplicates]).to(lo.dtype)]
-    ).tolist()
-    if min_row < 0 or min_col < 0 or max_row >= height or max_col >= width:
+    _check_sparse_tile_size(tile_size)
+    pixels = _pixels_jagged(pixels_to_render)
+    empty = active_tiles.numel() == 0
+    if empty and (pixels.jdata.shape[0] != 0 or pixel_map.numel() != 0):
         raise ValueError(
-            f"pixels_to_render coordinates must lie in [0, {height}) x [0, {width}), "
-            f"got rows in [{min_row}, {max_row}] and cols in [{min_col}, {max_col}]"
+            "active_tiles is empty but pixels_to_render or pixel_map is not; "
+            "the sparse layout does not match the pixel selection"
         )
-    if duplicates:
-        raise ValueError("pixels_to_render must not contain duplicate pixels within one camera")
+    return pixels, empty
 
 
 def _wrap(impl: "_fvdb_cpp.JaggedTensor") -> JaggedTensor:
@@ -744,10 +737,10 @@ def build_sparse_gaussian_tile_layout(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build the tile bookkeeping needed to rasterize an arbitrary set of pixels.
 
-    Coordinates are validated before the kernel runs: they must lie inside the
-    ``num_tiles_h * tile_size`` by ``num_tiles_w * tile_size`` image and each pixel may appear only once
-    per camera. Let ``AT`` be the number of tiles that contain at least one requested pixel and ``AP``
-    the total pixel count. An empty selection yields ``AT = 0`` outputs of the same dtypes.
+    Coordinates must lie inside the ``num_tiles_h * tile_size`` by ``num_tiles_w * tile_size`` image and
+    each pixel may appear only once per camera; the kernel raises ``ValueError`` otherwise. Let ``AT``
+    be the number of tiles that contain at least one requested pixel and ``AP`` the total pixel count.
+    An empty selection yields ``AT = 0`` outputs of the same dtypes.
 
     Args:
         tile_size (int): Tile side length in pixels. Must be ``16``.
@@ -767,8 +760,9 @@ def build_sparse_gaussian_tile_layout(
             shape ``[AP]``.
     """
     _check_sparse_tile_size(tile_size)
+    if num_tiles_h <= 0 or num_tiles_w <= 0:
+        raise ValueError(f"num_tiles_h and num_tiles_w must be positive, got {num_tiles_h} and {num_tiles_w}")
     pixels = _pixels_jagged(pixels_to_render)
-    _check_pixel_coordinates(pixels, tile_size, num_tiles_h, num_tiles_w)
     return _fvdb_cpp.build_sparse_gaussian_tile_layout(tile_size, num_tiles_w, num_tiles_h, pixels._impl)
 
 
@@ -966,9 +960,8 @@ def rasterize_screen_space_gaussians_sparse_fwd(
         last_ids (JaggedTensor): Tile-relative index of the last blended intersection per requested
             pixel, or ``-1``.
     """
-    _check_sparse_tile_size(tile_size)
-    pixels = _pixels_jagged(pixels_to_render)
-    if active_tiles.numel() == 0:
+    pixels, empty = _sparse_prologue(tile_size, pixels_to_render, active_tiles, pixel_map)
+    if empty:
         return (
             _empty_like_pixels(pixels, (features.shape[-1],), features.dtype),
             _empty_like_pixels(pixels, (1,), features.dtype),
@@ -1062,8 +1055,8 @@ def rasterize_screen_space_gaussians_sparse_bwd(
         d_loss_d_features (torch.Tensor): Gradient w.r.t. ``features``, shape ``[C, N, D]``.
         d_loss_d_opacities (torch.Tensor): Gradient w.r.t. ``opacities``, shape ``[C, N]``.
     """
-    _check_sparse_tile_size(tile_size)
-    if active_tiles.numel() == 0:
+    pixels, empty = _sparse_prologue(tile_size, pixels_to_render, active_tiles, pixel_map)
+    if empty:
         return (
             torch.zeros_like(means2d) if abs_grad else None,
             torch.zeros_like(means2d),
@@ -1072,7 +1065,7 @@ def rasterize_screen_space_gaussians_sparse_bwd(
             torch.zeros_like(opacities),
         )
     return _fvdb_cpp.rasterize_screen_space_gaussians_sparse_bwd(
-        _pixels_impl(pixels_to_render),
+        pixels._impl,
         means2d,
         conics,
         features,
@@ -1359,9 +1352,8 @@ def rasterize_num_contributing_gaussians_sparse(
         num_contributing (JaggedTensor): Contributing Gaussian count per requested pixel, ``int32``.
         alphas (JaggedTensor): Accumulated alpha per requested pixel, one scalar per pixel.
     """
-    _check_sparse_tile_size(tile_size)
-    pixels = _pixels_jagged(pixels_to_render)
-    if active_tiles.numel() == 0:
+    pixels, empty = _sparse_prologue(tile_size, pixels_to_render, active_tiles, pixel_map)
+    if empty:
         return _empty_like_pixels(pixels, (), torch.int32), _empty_like_pixels(pixels, (), opacities.dtype)
     result = _fvdb_cpp.rasterize_num_contributing_gaussians_sparse(
         means2d,
@@ -1491,9 +1483,8 @@ def rasterize_contributing_gaussian_ids_sparse(
         gaussian_ids (JaggedTensor): Contributing Gaussian indices per requested pixel, ``int32``.
         weights (JaggedTensor): Blend weight of each listed Gaussian.
     """
-    _check_sparse_tile_size(tile_size)
-    pixels = _pixels_jagged(pixels_to_render)
-    if active_tiles.numel() == 0:
+    pixels, empty = _sparse_prologue(tile_size, pixels_to_render, active_tiles, pixel_map)
+    if empty:
         return _empty_like_pixels(pixels, (), torch.int32), _empty_like_pixels(pixels, (), opacities.dtype)
     counts = (
         None
@@ -1616,9 +1607,8 @@ def rasterize_top_contributing_gaussian_ids_sparse(
             ``[num_depth_samples]``, ``int32``.
         weights (JaggedTensor): Blend weight of each recorded contributor, same structure.
     """
-    _check_sparse_tile_size(tile_size)
-    pixels = _pixels_jagged(pixels_to_render)
-    if active_tiles.numel() == 0:
+    pixels, empty = _sparse_prologue(tile_size, pixels_to_render, active_tiles, pixel_map)
+    if empty:
         return (
             _empty_like_pixels(pixels, (num_depth_samples,), torch.int32),
             _empty_like_pixels(pixels, (num_depth_samples,), opacities.dtype),

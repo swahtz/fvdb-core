@@ -38,8 +38,8 @@ namespace fvdb::detail::ops {
 /// @param numTilesH Number of tiles along height dimension
 /// @param pixelsToRender JaggedTensor containing pixel coordinates to render
 ///
-/// @pre pixelsToRender must not contain duplicate pixel coordinates within
-///      the same image. Callers must deduplicate before calling this function.
+/// @throws c10::ValueError if any pixel lies outside the numTilesH*tileSideLength by
+///         numTilesW*tileSideLength image, or if a pixel appears more than once in the same image.
 /// @return Tuple of (active_tiles, active_tile_mask, tile_pixel_mask, tile_pixel_cumsum, pixel_map)
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 buildSparseGaussianTileLayout(const int32_t tileSideLength,

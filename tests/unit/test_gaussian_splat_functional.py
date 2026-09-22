@@ -7,6 +7,7 @@ These tests pin the public contract that downstream autograd wrappers rely on. T
 rendering correctness or gradients; the C++ gtests cover kernel numerics and gradient checks live
 with the differentiable pipeline downstream.
 """
+
 import math
 import os
 import tempfile
@@ -460,8 +461,9 @@ class GaussianSplatFunctionalTests(unittest.TestCase):
             )
             self.assertEqual(tuple(mask.shape), (num_cameras, self.tiles_h, self.tiles_w))
             self.assertGreater(active_tiles.numel(), 0)
-        # 2-D tensors are ambiguous ([P, 2] vs [C, 2]) and refused; 1-D is malformed.
-        for bad in (px0, px0.reshape(-1)):
+        # 2-D tensors are ambiguous ([P, 2] vs [C, 2]) and refused; other malformed shapes too.
+        P = px0.shape[0]
+        for bad in (px0, px0.reshape(-1), px0.reshape(1, P * 2, 1), px0.new_empty(0, P, 2)):
             with self.assertRaises(ValueError):
                 F.build_sparse_gaussian_tile_layout(self.tile_size, self.tiles_h, self.tiles_w, bad)
 
@@ -488,6 +490,58 @@ class GaussianSplatFunctionalTests(unittest.TestCase):
         layout(self.tile_size, self.tiles_h, self.tiles_w, JaggedTensor([px0, px0]))
         with self.assertRaises(ValueError):  # non-positive tile grid
             layout(self.tile_size, 0, self.tiles_w, JaggedTensor([px0]))
+
+    def test_sparse_wrappers_reject_layout_selection_mismatch(self):
+        empty = JaggedTensor([torch.empty(0, 2, dtype=torch.int64, device=self.device) for _ in range(self.C)])
+        active_tiles, _, tile_pixel_mask, tile_pixel_cumsum, pixel_map = F.build_sparse_gaussian_tile_layout(
+            self.tile_size, self.tiles_h, self.tiles_w, empty
+        )
+        tile_offsets = torch.zeros(1, dtype=torch.int64, device=self.device)
+        ids = torch.empty(0, dtype=torch.int32, device=self.device)
+        # Empty layout with a non-empty selection must not silently return zeros.
+        with self.assertRaises(ValueError):
+            F.rasterize_screen_space_gaussians_sparse_fwd(
+                self.pixels,
+                self.means2d,
+                self.conics,
+                self.features,
+                self.opacities,
+                self.W,
+                self.H,
+                0,
+                0,
+                self.tile_size,
+                tile_offsets,
+                ids,
+                active_tiles,
+                tile_pixel_mask,
+                tile_pixel_cumsum,
+                pixel_map,
+            )
+        with self.assertRaises(ValueError):
+            F.rasterize_screen_space_gaussians_sparse_bwd(
+                self.pixels,
+                self.means2d,
+                self.conics,
+                self.features,
+                self.opacities,
+                self.W,
+                self.H,
+                0,
+                0,
+                self.tile_size,
+                tile_offsets,
+                ids,
+                empty,
+                empty,
+                empty,
+                empty,
+                active_tiles,
+                tile_pixel_mask,
+                tile_pixel_cumsum,
+                pixel_map,
+                False,
+            )
 
     def test_sparse_wrappers_reject_non_16_tile_size(self):
         active_tiles, _, tile_pixel_mask, tile_pixel_cumsum, pixel_map, tile_offsets, ids = self._sparse_layout()
