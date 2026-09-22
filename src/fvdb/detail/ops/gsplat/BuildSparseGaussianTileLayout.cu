@@ -234,11 +234,12 @@ buildSparseGaussianTileLayout(const int32_t tileSideLength,
     const torch::TensorOptions optionsBool =
         torch::TensorOptions().device(device).dtype(torch::kBool);
 
+    // Same dtypes and shapes as the populated path with AT = 0 active tiles.
     if (numImages == 0 || numPixels == 0) {
         return {empty({0}, torch::kInt, device),
                 zeros({numImages, numTilesH, numTilesW}, torch::kBool, device),
-                empty({0, numWordsPerTileBitmask(tileSideLength)}, torch::kLong, device),
-                zeros({1}, torch::kLong, device),
+                empty({0, numWordsPerTileBitmask(tileSideLength)}, torch::kUInt64, device),
+                empty({0}, torch::kLong, device),
                 empty({0}, torch::kLong, device)};
     }
 

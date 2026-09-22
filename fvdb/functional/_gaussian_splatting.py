@@ -15,11 +15,13 @@ Conventions shared by every function:
 - Pixel coordinates have their origin at the top-left corner of the image; x grows to the right
   and y grows downward.
 - ``pixels_to_render`` is a :class:`~fvdb.JaggedTensor` with one ``[P_c, 2]`` list of ``(row, col)``
-  integer pixel coordinates per camera. A plain ``[C, P, 2]`` tensor (or ``[P, 2]`` for one camera)
-  is also accepted.
+  integer pixel coordinates per camera. A plain ``[C, P, 2]`` tensor is also accepted; 2-D tensors are
+  rejected because ``[P, 2]`` and ``[C, 2]`` cannot be told apart.
 - The sparse rasterization kernels are compiled for ``tile_size == 16``; the sparse wrappers reject
   any other value. Dense kernels accept any tile size.
 - Outputs the kernel does not produce for the given arguments come back as ``None``.
+- Sparse functions given a layout with no active tiles return empty results without launching a
+  kernel, so a selection emptied by filtering flows through the pipeline.
 - Camera enums are accepted as :class:`~fvdb.CameraModel`, :class:`~fvdb.RollingShutterType`,
   their integer values, or the bound C++ enum members.
 """
@@ -66,15 +68,18 @@ def _pixels_jagged(value: JaggedTensor | torch.Tensor) -> JaggedTensor:
     if isinstance(value, torch.Tensor):
         if value.dim() == 3:
             return JaggedTensor(list(value.unbind(0)))
-        if value.dim() == 2:
-            return JaggedTensor([value])
-        raise ValueError(f"pixels_to_render tensor must have shape [C, P, 2] or [P, 2], got {tuple(value.shape)}")
+        raise ValueError(f"pixels_to_render tensor must have shape [C, P, 2], got {tuple(value.shape)}")
     raise TypeError(f"pixels_to_render must be a fvdb.JaggedTensor or torch.Tensor, got {type(value).__name__}")
 
 
 def _pixels_impl(value: JaggedTensor | torch.Tensor) -> "_fvdb_cpp.JaggedTensor":
     """C++ implementation object for ``pixels_to_render`` in either accepted form."""
     return _pixels_jagged(value)._impl
+
+
+def _empty_like_pixels(pixels: JaggedTensor, element_shape: tuple[int, ...], dtype: torch.dtype) -> JaggedTensor:
+    """An empty per-pixel result with the same camera structure as an empty ``pixels`` selection."""
+    return pixels.jagged_like(torch.empty((0, *element_shape), dtype=dtype, device=pixels.device))
 
 
 def _check_sparse_tile_size(tile_size: int) -> None:
@@ -86,8 +91,9 @@ def _check_sparse_tile_size(tile_size: int) -> None:
 def _check_pixel_coordinates(pixels: JaggedTensor, tile_size: int, num_tiles_h: int, num_tiles_w: int) -> None:
     """Validate pixel coordinates before the layout kernel indexes tile buffers with them.
 
-    The kernel derives tile ids from the coordinates without bounds checks, so malformed input would
-    otherwise corrupt device memory rather than raise. Costs one device synchronization.
+    The kernel derives tile ids from the coordinates without bounds checks, and its pixel bookkeeping
+    assumes each pixel appears once per camera. Both are checked here with a single device
+    synchronization.
     """
     if num_tiles_h <= 0 or num_tiles_w <= 0:
         raise ValueError(f"num_tiles_h and num_tiles_w must be positive, got {num_tiles_h} and {num_tiles_w}")
@@ -98,14 +104,23 @@ def _check_pixel_coordinates(pixels: JaggedTensor, tile_size: int, num_tiles_h: 
         raise TypeError(f"pixels_to_render must be int32 or int64, got {coords.dtype}")
     if coords.numel() == 0:
         return
-    lo, hi = torch.aminmax(coords, dim=0)
-    (min_row, min_col), (max_row, max_col) = torch.stack([lo, hi]).tolist()
     height, width = num_tiles_h * tile_size, num_tiles_w * tile_size
+    lo, hi = torch.aminmax(coords, dim=0)
+    linear = (pixels.jidx.to(torch.int64) * height + coords[:, 0].to(torch.int64)) * width + coords[:, 1].to(
+        torch.int64
+    )
+    sorted_linear = torch.sort(linear).values
+    has_duplicates = (sorted_linear[1:] == sorted_linear[:-1]).any()
+    (min_row, min_col), (max_row, max_col), (duplicates, _) = torch.stack(
+        [lo, hi, torch.stack([has_duplicates, has_duplicates]).to(lo.dtype)]
+    ).tolist()
     if min_row < 0 or min_col < 0 or max_row >= height or max_col >= width:
         raise ValueError(
             f"pixels_to_render coordinates must lie in [0, {height}) x [0, {width}), "
             f"got rows in [{min_row}, {max_row}] and cols in [{min_col}, {max_col}]"
         )
+    if duplicates:
+        raise ValueError("pixels_to_render must not contain duplicate pixels within one camera")
 
 
 def _wrap(impl: "_fvdb_cpp.JaggedTensor") -> JaggedTensor:
@@ -202,8 +217,10 @@ def project_gaussians_analytic_bwd(
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Backward pass of :func:`project_gaussians_analytic_fwd`.
 
-    The three optional ``out_*`` accumulators are updated in place when given. They gather the
-    per-Gaussian statistics used by densification strategies (split, clone, prune).
+    The optional ``out_*`` accumulators gather per-Gaussian statistics for densification strategies
+    (split, clone, prune). The kernel updates them in place only when both
+    ``out_normalized_d_loss_d_means2d_norm_accum`` and ``out_gradient_step_counts`` are given;
+    ``out_normalized_max_radii_accum`` is updated only alongside those two.
 
     Args:
         means (torch.Tensor): Gaussian centers, shape ``[N, 3]``.
@@ -224,12 +241,12 @@ def project_gaussians_analytic_bwd(
             ``[C, N]``, or ``None``.
         world_to_cam_matrices_requires_grad (bool): Whether to compute the camera-matrix gradient.
         ortho (bool): Whether the forward pass used an orthographic projection.
-        out_normalized_d_loss_d_means2d_norm_accum (torch.Tensor | None): Optional ``[N]`` accumulator
-            of normalized 2D mean gradient norms, updated in place.
-        out_normalized_max_radii_accum (torch.Tensor | None): Optional ``[N]`` accumulator of maximum
-            normalized 2D radii, updated in place.
+        out_normalized_d_loss_d_means2d_norm_accum (torch.Tensor | None): Optional ``[N]`` float
+            accumulator of image-normalized 2D mean gradient norms.
+        out_normalized_max_radii_accum (torch.Tensor | None): Optional ``[N]`` ``int32`` accumulator of
+            the maximum projected radius in pixels.
         out_gradient_step_counts (torch.Tensor | None): Optional ``[N]`` ``int32`` accumulator of
-            gradient step counts, updated in place.
+            gradient step counts.
 
     Returns:
         d_loss_d_means (torch.Tensor): Gradient w.r.t. ``means``, shape ``[N, 3]``.
@@ -508,27 +525,34 @@ def evaluate_spherical_harmonics_fwd(
 ) -> torch.Tensor:
     """Evaluate view-dependent spherical harmonics into per-camera, per-Gaussian features.
 
-    In dense mode ``camera_ids`` and ``gaussian_ids`` are empty and every Gaussian is evaluated for
-    every camera. In packed mode they list one ``(camera, gaussian)`` pair per work item. Gaussians
-    whose ``radii`` are not positive on both axes are skipped.
+    Dense mode: ``camera_ids`` and ``gaussian_ids`` are empty, every Gaussian is evaluated for every
+    camera, and coefficients are indexed by Gaussian. Packed mode: ``num_cameras`` must be ``1`` and
+    the inputs describe ``M`` work items directly. ``camera_ids[i]`` and ``gaussian_ids[i]`` select the
+    camera matrix and the mean used for work item ``i``'s view direction, while ``sh0_coeffs[i]``,
+    ``sh_n_coeffs[i]`` and ``radii[0, i]`` are read by work item, so coefficients must already be
+    gathered into work-item order. Work items whose ``radii`` are not positive on both axes yield
+    zero features.
 
     Args:
         sh_degree_to_use (int): Highest SH degree to evaluate, ``0`` to ``3``.
-        num_cameras (int): Number of cameras ``C``.
+        num_cameras (int): Number of cameras ``C`` in dense mode; must be ``1`` in packed mode.
         means (torch.Tensor): Gaussian centers in world space, shape ``[N, 3]``.
-        world_to_cam_matrices (torch.Tensor): Rigid world-to-camera transforms, shape ``[C, 4, 4]``.
-        camera_ids (torch.Tensor): Packed-mode camera index per work item, ``int32`` shape ``[M]``,
-            or an empty tensor.
-        gaussian_ids (torch.Tensor): Packed-mode Gaussian index per work item, ``int32`` shape ``[M]``,
-            or an empty tensor.
-        sh0_coeffs (torch.Tensor): Degree-0 coefficients, shape ``[N, 1, D]``.
-        sh_n_coeffs (torch.Tensor): Higher-degree coefficients, shape ``[N, K-1, D]`` with
-            ``K = (sh_degree_to_use + 1)**2``, or an empty tensor when ``sh_degree_to_use == 0``.
-        radii (torch.Tensor): Projected per-axis radii, shape ``[C, N, 2]``.
+        world_to_cam_matrices (torch.Tensor): Rigid world-to-camera transforms, shape ``[C, 4, 4]``
+            (any number of matrices in packed mode, indexed by ``camera_ids``).
+        camera_ids (torch.Tensor): Packed-mode camera matrix index per work item, ``int32`` shape
+            ``[M]``, or an empty tensor.
+        gaussian_ids (torch.Tensor): Packed-mode index into ``means`` per work item, ``int32`` shape
+            ``[M]``, or an empty tensor.
+        sh0_coeffs (torch.Tensor): Degree-0 coefficients, shape ``[N, 1, D]`` dense or ``[M, 1, D]``
+            packed.
+        sh_n_coeffs (torch.Tensor): Higher-degree coefficients, shape ``[N, K-1, D]`` dense or
+            ``[M, K-1, D]`` packed, with ``K = (sh_degree_to_use + 1)**2``, or an empty tensor when
+            ``sh_degree_to_use == 0``.
+        radii (torch.Tensor): Projected per-axis radii, shape ``[C, N, 2]`` dense or ``[1, M, 2]``
+            packed.
 
     Returns:
-        features (torch.Tensor): Evaluated features, shape ``[C, N, D]`` in dense mode or ``[M, D]``
-            in packed mode.
+        features (torch.Tensor): Evaluated features, shape ``[C, N, D]`` dense or ``[1, M, D]`` packed.
     """
     return _fvdb_cpp.evaluate_spherical_harmonics_fwd(
         sh_degree_to_use,
@@ -559,17 +583,24 @@ def evaluate_spherical_harmonics_bwd(
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     """Backward pass of :func:`evaluate_spherical_harmonics_fwd`.
 
+    In packed mode the same work-item layout applies: coefficient gradients come back in work-item
+    order (``[M, ...]``), while ``d_loss_d_means`` and ``d_loss_d_world_to_cam_matrices`` are
+    scattered onto the ``means`` rows and camera matrices selected by ``gaussian_ids`` and
+    ``camera_ids``.
+
     Args:
         sh_degree_to_use (int): SH degree used in the forward pass.
-        num_cameras (int): Number of cameras ``C``.
-        num_gaussians (int): Number of Gaussians ``N``.
+        num_cameras (int): Number of cameras ``C``; ``1`` in packed mode.
+        num_gaussians (int): Number of Gaussians ``N`` in dense mode, or work items ``M`` in packed mode.
         means (torch.Tensor): Gaussian centers, shape ``[N, 3]``.
         world_to_cam_matrices (torch.Tensor): Rigid world-to-camera transforms, shape ``[C, 4, 4]``.
-        camera_ids (torch.Tensor): Packed-mode camera indices, or an empty tensor.
-        gaussian_ids (torch.Tensor): Packed-mode Gaussian indices, or an empty tensor.
+        camera_ids (torch.Tensor): Packed-mode camera matrix indices, ``int32`` shape ``[M]``, or empty.
+        gaussian_ids (torch.Tensor): Packed-mode indices into ``means``, ``int32`` shape ``[M]``, or empty.
         sh_n_coeffs (torch.Tensor): Higher-degree coefficients used in the forward pass.
-        d_loss_d_colors (torch.Tensor): Loss gradient w.r.t. the forward features, shape ``[C, N, D]``.
-        radii (torch.Tensor): Projected per-axis radii used in the forward pass, shape ``[C, N, 2]``.
+        d_loss_d_colors (torch.Tensor): Loss gradient w.r.t. the forward features, shape ``[C, N, D]``
+            dense or ``[1, M, D]`` packed.
+        radii (torch.Tensor): Projected per-axis radii used in the forward pass, shape ``[C, N, 2]``
+            dense or ``[1, M, 2]`` packed.
         compute_d_loss_d_means (bool): Whether to compute the gradient w.r.t. ``means``.
         compute_d_loss_d_world_to_cam_matrices (bool): Whether to compute the gradient w.r.t.
             ``world_to_cam_matrices``.
@@ -713,10 +744,10 @@ def build_sparse_gaussian_tile_layout(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build the tile bookkeeping needed to rasterize an arbitrary set of pixels.
 
-    ``pixels_to_render`` must not contain duplicate pixels within one camera. Coordinates are
-    validated to lie inside the ``num_tiles_h * tile_size`` by ``num_tiles_w * tile_size`` image before
-    the kernel runs. Let ``AT`` be the number of tiles that contain at least one requested pixel and
-    ``AP`` the total pixel count.
+    Coordinates are validated before the kernel runs: they must lie inside the
+    ``num_tiles_h * tile_size`` by ``num_tiles_w * tile_size`` image and each pixel may appear only once
+    per camera. Let ``AT`` be the number of tiles that contain at least one requested pixel and ``AP``
+    the total pixel count. An empty selection yields ``AT = 0`` outputs of the same dtypes.
 
     Args:
         tile_size (int): Tile side length in pixels. Must be ``16``.
@@ -936,8 +967,15 @@ def rasterize_screen_space_gaussians_sparse_fwd(
             pixel, or ``-1``.
     """
     _check_sparse_tile_size(tile_size)
+    pixels = _pixels_jagged(pixels_to_render)
+    if active_tiles.numel() == 0:
+        return (
+            _empty_like_pixels(pixels, (features.shape[-1],), features.dtype),
+            _empty_like_pixels(pixels, (1,), features.dtype),
+            _empty_like_pixels(pixels, (), torch.int32),
+        )
     result = _fvdb_cpp.rasterize_screen_space_gaussians_sparse_fwd(
-        _pixels_impl(pixels_to_render),
+        pixels._impl,
         means2d,
         conics,
         features,
@@ -1025,6 +1063,14 @@ def rasterize_screen_space_gaussians_sparse_bwd(
         d_loss_d_opacities (torch.Tensor): Gradient w.r.t. ``opacities``, shape ``[C, N]``.
     """
     _check_sparse_tile_size(tile_size)
+    if active_tiles.numel() == 0:
+        return (
+            torch.zeros_like(means2d) if abs_grad else None,
+            torch.zeros_like(means2d),
+            torch.zeros_like(conics),
+            torch.zeros_like(features),
+            torch.zeros_like(opacities),
+        )
     return _fvdb_cpp.rasterize_screen_space_gaussians_sparse_bwd(
         _pixels_impl(pixels_to_render),
         means2d,
@@ -1314,13 +1360,16 @@ def rasterize_num_contributing_gaussians_sparse(
         alphas (JaggedTensor): Accumulated alpha per requested pixel, one scalar per pixel.
     """
     _check_sparse_tile_size(tile_size)
+    pixels = _pixels_jagged(pixels_to_render)
+    if active_tiles.numel() == 0:
+        return _empty_like_pixels(pixels, (), torch.int32), _empty_like_pixels(pixels, (), opacities.dtype)
     result = _fvdb_cpp.rasterize_num_contributing_gaussians_sparse(
         means2d,
         conics,
         opacities,
         tile_offsets,
         tile_gaussian_ids,
-        _pixels_impl(pixels_to_render),
+        pixels._impl,
         active_tiles,
         tile_pixel_mask,
         tile_pixel_cumsum,
@@ -1443,6 +1492,9 @@ def rasterize_contributing_gaussian_ids_sparse(
         weights (JaggedTensor): Blend weight of each listed Gaussian.
     """
     _check_sparse_tile_size(tile_size)
+    pixels = _pixels_jagged(pixels_to_render)
+    if active_tiles.numel() == 0:
+        return _empty_like_pixels(pixels, (), torch.int32), _empty_like_pixels(pixels, (), opacities.dtype)
     counts = (
         None
         if num_contributing_gaussians is None
@@ -1454,7 +1506,7 @@ def rasterize_contributing_gaussian_ids_sparse(
         opacities,
         tile_offsets,
         tile_gaussian_ids,
-        _pixels_impl(pixels_to_render),
+        pixels._impl,
         active_tiles,
         tile_pixel_mask,
         tile_pixel_cumsum,
@@ -1565,13 +1617,19 @@ def rasterize_top_contributing_gaussian_ids_sparse(
         weights (JaggedTensor): Blend weight of each recorded contributor, same structure.
     """
     _check_sparse_tile_size(tile_size)
+    pixels = _pixels_jagged(pixels_to_render)
+    if active_tiles.numel() == 0:
+        return (
+            _empty_like_pixels(pixels, (num_depth_samples,), torch.int32),
+            _empty_like_pixels(pixels, (num_depth_samples,), opacities.dtype),
+        )
     result = _fvdb_cpp.rasterize_top_contributing_gaussian_ids_sparse(
         means2d,
         conics,
         opacities,
         tile_offsets,
         tile_gaussian_ids,
-        _pixels_impl(pixels_to_render),
+        pixels._impl,
         active_tiles,
         tile_pixel_mask,
         tile_pixel_cumsum,

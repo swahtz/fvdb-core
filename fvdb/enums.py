@@ -16,10 +16,21 @@ except ImportError:  # Python 3.10 does not provide enum.StrEnum.
 def _to_cpp_enum(py_enum, cpp_enum, value):
     """Map ``value`` to the ``cpp_enum`` member sharing a name with the matching ``py_enum`` member.
 
-    ``value`` may be a ``py_enum`` member, its integer value, or a member of the bound C++ enum
-    itself (pybind11 enums compare unequal to ints, so they are coerced through ``int()`` first).
+    ``value`` may be a ``py_enum`` member, a plain ``int`` holding one of its values, or a member of
+    ``cpp_enum`` itself (pybind11 enums compare unequal to ints, so they are coerced through
+    ``int()``). Members of other enums, ``bool`` and non-integers are rejected.
     """
-    return getattr(cpp_enum, py_enum(int(value)).name)
+    if isinstance(value, py_enum):
+        member = value
+    elif isinstance(value, cpp_enum):
+        member = py_enum(int(value))
+    elif isinstance(value, int) and not isinstance(value, (bool, IntEnum)):
+        member = py_enum(value)
+    else:
+        raise TypeError(
+            f"expected {py_enum.__name__}, an int value, or {cpp_enum.__name__}, got {type(value).__name__}"
+        )
+    return getattr(cpp_enum, member.name)
 
 
 class ConvolutionTopologyPolicy(StrEnum):
