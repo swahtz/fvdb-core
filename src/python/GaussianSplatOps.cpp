@@ -214,7 +214,7 @@ bind_gaussian_splat_ops(py::module &m) {
           py::arg("filename"),
           py::arg("device") = torch::kCPU);
 
-    // ------- Raw forward/backward dispatch (for Python autograd) -------
+    // ------- Forward/backward kernel pairs -------
 
     m.def("project_gaussians_analytic_fwd",
           &ops::projectGaussiansAnalyticFwd,

@@ -13,6 +13,15 @@ except ImportError:  # Python 3.10 does not provide enum.StrEnum.
         __str__ = str.__str__
 
 
+def _to_cpp_enum(py_enum, cpp_enum, value):
+    """Map ``value`` to the ``cpp_enum`` member sharing a name with the matching ``py_enum`` member.
+
+    ``value`` may be a ``py_enum`` member, its integer value, or a member of the bound C++ enum
+    itself (pybind11 enums compare unequal to ints, so they are coerced through ``int()`` first).
+    """
+    return getattr(cpp_enum, py_enum(int(value)).name)
+
+
 class ConvolutionTopologyPolicy(StrEnum):
     """Policy controlling the finite output topology of a convolution plan."""
 
@@ -104,16 +113,16 @@ class CameraModel(IntEnum):
     """Ideal pinhole camera (no distortion)."""
 
     OPENCV_RADTAN_5 = 1
-    """OpenCV radial-tangential distortion with 5 parameters (k1, k2, p1, p2, k3)."""
+    """OpenCV radial-tangential distortion. Uses the packed slots ``k1, k2, k3, p1, p2``; ``k4..k6`` and ``s1..s4`` must be zero."""
 
     OPENCV_RATIONAL_8 = 2
-    """OpenCV rational radial-tangential distortion with 8 parameters (k1..k6, p1, p2)."""
+    """OpenCV rational radial-tangential distortion. Uses the packed slots ``k1..k6, p1, p2``; ``s1..s4`` must be zero."""
 
     OPENCV_RADTAN_THIN_PRISM_9 = 3
-    """OpenCV radial-tangential plus thin-prism distortion with 9 parameters (k1, k2, p1, p2, k3, s1..s4)."""
+    """OpenCV radial-tangential plus thin-prism distortion. Uses ``k1, k2, k3, p1, p2, s1..s4``; ``k4..k6`` must be zero."""
 
     OPENCV_THIN_PRISM_12 = 4
-    """OpenCV rational radial-tangential plus thin-prism distortion with 12 parameters (k1..k6, p1, p2, s1..s4)."""
+    """OpenCV rational radial-tangential plus thin-prism distortion. Uses all twelve packed slots."""
 
     ORTHOGRAPHIC = 5
     """Orthographic camera (no distortion)."""

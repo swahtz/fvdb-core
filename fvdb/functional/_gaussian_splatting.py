@@ -17,9 +17,11 @@ Conventions shared by every function:
 - ``pixels_to_render`` is a :class:`~fvdb.JaggedTensor` with one ``[P_c, 2]`` list of ``(row, col)``
   integer pixel coordinates per camera. A plain ``[C, P, 2]`` tensor (or ``[P, 2]`` for one camera)
   is also accepted.
+- The sparse rasterization kernels are compiled for ``tile_size == 16``; the sparse wrappers reject
+  any other value. Dense kernels accept any tile size.
 - Outputs the kernel does not produce for the given arguments come back as ``None``.
-- Camera enums are accepted as :class:`~fvdb.CameraModel`, :class:`~fvdb.RollingShutterType` or
-  their integer values.
+- Camera enums are accepted as :class:`~fvdb.CameraModel`, :class:`~fvdb.RollingShutterType`,
+  their integer values, or the bound C++ enum members.
 """
 
 from __future__ import annotations
@@ -29,35 +31,81 @@ from typing import Any, Mapping
 import torch
 
 from .. import _fvdb_cpp
-from ..enums import CameraModel, RollingShutterType
+from ..enums import CameraModel, RollingShutterType, _to_cpp_enum
 from ..jagged_tensor import JaggedTensor
 
+# The sparse rasterization kernels use a 16x16 block scan to index active pixels within a tile.
+_SPARSE_TILE_SIZE = 16
+
 # ---------------------------------------------------------------------------
-#  Conversion helpers
+#  Conversion and validation helpers
 # ---------------------------------------------------------------------------
 
 
 def _to_cpp_camera_model(camera_model: CameraModel | int) -> "_fvdb_cpp.CameraModel":
-    """Convert a public :class:`fvdb.CameraModel` (or its int value) to the bound C++ enum."""
-    return getattr(_fvdb_cpp.CameraModel, CameraModel(camera_model).name)
+    """Convert a :class:`fvdb.CameraModel`, its int value, or the bound C++ member to the C++ enum."""
+    return _to_cpp_enum(CameraModel, _fvdb_cpp.CameraModel, camera_model)
 
 
 def _to_cpp_rolling_shutter(rolling_shutter_type: RollingShutterType | int) -> "_fvdb_cpp.RollingShutterType":
-    """Convert a public :class:`fvdb.RollingShutterType` (or its int value) to the bound C++ enum."""
-    return getattr(_fvdb_cpp.RollingShutterType, RollingShutterType(rolling_shutter_type).name)
+    """Convert a :class:`fvdb.RollingShutterType`, its int value, or the bound C++ member to the C++ enum."""
+    return _to_cpp_enum(RollingShutterType, _fvdb_cpp.RollingShutterType, rolling_shutter_type)
 
 
-def _jagged_impl(value: JaggedTensor | torch.Tensor, name: str) -> "_fvdb_cpp.JaggedTensor":
-    """Return the C++ implementation object behind ``value``, wrapping a plain tensor if needed."""
+def _jagged_impl(value: JaggedTensor, name: str) -> "_fvdb_cpp.JaggedTensor":
+    """Return the C++ implementation object behind a public :class:`fvdb.JaggedTensor`."""
+    if not isinstance(value, JaggedTensor):
+        raise TypeError(f"{name} must be a fvdb.JaggedTensor, got {type(value).__name__}")
+    return value._impl
+
+
+def _pixels_jagged(value: JaggedTensor | torch.Tensor) -> JaggedTensor:
+    """Normalize ``pixels_to_render`` to a JaggedTensor with one ``[P_c, 2]`` list per camera."""
     if isinstance(value, JaggedTensor):
-        return value._impl
+        return value
     if isinstance(value, torch.Tensor):
         if value.dim() == 3:
-            return JaggedTensor(list(value.unbind(0)))._impl
+            return JaggedTensor(list(value.unbind(0)))
         if value.dim() == 2:
-            return JaggedTensor([value])._impl
-        raise ValueError(f"{name} tensor must have shape [C, P, 2] or [P, 2], got {tuple(value.shape)}")
-    raise TypeError(f"{name} must be a fvdb.JaggedTensor or torch.Tensor, got {type(value).__name__}")
+            return JaggedTensor([value])
+        raise ValueError(f"pixels_to_render tensor must have shape [C, P, 2] or [P, 2], got {tuple(value.shape)}")
+    raise TypeError(f"pixels_to_render must be a fvdb.JaggedTensor or torch.Tensor, got {type(value).__name__}")
+
+
+def _pixels_impl(value: JaggedTensor | torch.Tensor) -> "_fvdb_cpp.JaggedTensor":
+    """C++ implementation object for ``pixels_to_render`` in either accepted form."""
+    return _pixels_jagged(value)._impl
+
+
+def _check_sparse_tile_size(tile_size: int) -> None:
+    """Reject tile sizes the sparse rasterization kernels are not compiled for."""
+    if tile_size != _SPARSE_TILE_SIZE:
+        raise ValueError(f"sparse Gaussian rasterization requires tile_size == {_SPARSE_TILE_SIZE}, got {tile_size}")
+
+
+def _check_pixel_coordinates(pixels: JaggedTensor, tile_size: int, num_tiles_h: int, num_tiles_w: int) -> None:
+    """Validate pixel coordinates before the layout kernel indexes tile buffers with them.
+
+    The kernel derives tile ids from the coordinates without bounds checks, so malformed input would
+    otherwise corrupt device memory rather than raise. Costs one device synchronization.
+    """
+    if num_tiles_h <= 0 or num_tiles_w <= 0:
+        raise ValueError(f"num_tiles_h and num_tiles_w must be positive, got {num_tiles_h} and {num_tiles_w}")
+    coords = pixels.jdata
+    if coords.dim() != 2 or coords.shape[1] != 2:
+        raise ValueError(f"pixels_to_render elements must be (row, col) pairs, got jdata shape {tuple(coords.shape)}")
+    if coords.dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"pixels_to_render must be int32 or int64, got {coords.dtype}")
+    if coords.numel() == 0:
+        return
+    lo, hi = torch.aminmax(coords, dim=0)
+    (min_row, min_col), (max_row, max_col) = torch.stack([lo, hi]).tolist()
+    height, width = num_tiles_h * tile_size, num_tiles_w * tile_size
+    if min_row < 0 or min_col < 0 or max_row >= height or max_col >= width:
+        raise ValueError(
+            f"pixels_to_render coordinates must lie in [0, {height}) x [0, {width}), "
+            f"got rows in [{min_row}, {max_row}] and cols in [{min_col}, {max_col}]"
+        )
 
 
 def _wrap(impl: "_fvdb_cpp.JaggedTensor") -> JaggedTensor:
@@ -479,7 +527,8 @@ def evaluate_spherical_harmonics_fwd(
         radii (torch.Tensor): Projected per-axis radii, shape ``[C, N, 2]``.
 
     Returns:
-        features (torch.Tensor): Evaluated features, shape ``[C, N, D]`` in dense mode.
+        features (torch.Tensor): Evaluated features, shape ``[C, N, D]`` in dense mode or ``[M, D]``
+            in packed mode.
     """
     return _fvdb_cpp.evaluate_spherical_harmonics_fwd(
         sh_degree_to_use,
@@ -657,20 +706,22 @@ def intersect_gaussian_tiles_sparse(
 
 
 def build_sparse_gaussian_tile_layout(
-    tile_side_length: int,
-    num_tiles_w: int,
+    tile_size: int,
     num_tiles_h: int,
+    num_tiles_w: int,
     pixels_to_render: JaggedTensor | torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build the tile bookkeeping needed to rasterize an arbitrary set of pixels.
 
-    ``pixels_to_render`` must not contain duplicate pixels within one camera. Let ``AT`` be the
-    number of tiles that contain at least one requested pixel and ``AP`` the total pixel count.
+    ``pixels_to_render`` must not contain duplicate pixels within one camera. Coordinates are
+    validated to lie inside the ``num_tiles_h * tile_size`` by ``num_tiles_w * tile_size`` image before
+    the kernel runs. Let ``AT`` be the number of tiles that contain at least one requested pixel and
+    ``AP`` the total pixel count.
 
     Args:
-        tile_side_length (int): Tile side length in pixels.
-        num_tiles_w (int): Number of tiles along the image width.
+        tile_size (int): Tile side length in pixels. Must be ``16``.
         num_tiles_h (int): Number of tiles along the image height.
+        num_tiles_w (int): Number of tiles along the image width.
         pixels_to_render (JaggedTensor | torch.Tensor): Integer ``(row, col)`` pixel coordinates, one
             ``[P_c, 2]`` list per camera (``int32`` or ``int64``).
 
@@ -684,12 +735,10 @@ def build_sparse_gaussian_tile_layout(
         pixel_map (torch.Tensor): Output slot for the ``k``-th requested pixel of each active tile,
             shape ``[AP]``.
     """
-    return _fvdb_cpp.build_sparse_gaussian_tile_layout(
-        tile_side_length,
-        num_tiles_w,
-        num_tiles_h,
-        _jagged_impl(pixels_to_render, "pixels_to_render"),
-    )
+    _check_sparse_tile_size(tile_size)
+    pixels = _pixels_jagged(pixels_to_render)
+    _check_pixel_coordinates(pixels, tile_size, num_tiles_h, num_tiles_w)
+    return _fvdb_cpp.build_sparse_gaussian_tile_layout(tile_size, num_tiles_w, num_tiles_h, pixels._impl)
 
 
 # ---------------------------------------------------------------------------
@@ -869,7 +918,7 @@ def rasterize_screen_space_gaussians_sparse_fwd(
         image_height (int): Height of the render window in pixels.
         image_origin_w (int): Horizontal pixel offset of the render window.
         image_origin_h (int): Vertical pixel offset of the render window.
-        tile_size (int): Tile side length.
+        tile_size (int): Tile side length. Must be ``16``.
         tile_offsets (torch.Tensor): Per-tile start offsets from :func:`intersect_gaussian_tiles_sparse`.
         tile_gaussian_ids (torch.Tensor): Per-intersection Gaussian ids from :func:`intersect_gaussian_tiles_sparse`.
         active_tiles (torch.Tensor): Flattened indices of the active tiles, shape ``[AT]``.
@@ -886,8 +935,9 @@ def rasterize_screen_space_gaussians_sparse_fwd(
         last_ids (JaggedTensor): Tile-relative index of the last blended intersection per requested
             pixel, or ``-1``.
     """
+    _check_sparse_tile_size(tile_size)
     result = _fvdb_cpp.rasterize_screen_space_gaussians_sparse_fwd(
-        _jagged_impl(pixels_to_render, "pixels_to_render"),
+        _pixels_impl(pixels_to_render),
         means2d,
         conics,
         features,
@@ -948,7 +998,7 @@ def rasterize_screen_space_gaussians_sparse_bwd(
         image_height (int): Height of the render window in pixels.
         image_origin_w (int): Horizontal pixel offset of the render window.
         image_origin_h (int): Vertical pixel offset of the render window.
-        tile_size (int): Tile side length.
+        tile_size (int): Tile side length. Must be ``16``.
         tile_offsets (torch.Tensor): Per-tile start offsets used in the forward pass.
         tile_gaussian_ids (torch.Tensor): Per-intersection Gaussian ids used in the forward pass.
         rendered_alphas (JaggedTensor): Forward alphas per requested pixel.
@@ -974,8 +1024,9 @@ def rasterize_screen_space_gaussians_sparse_bwd(
         d_loss_d_features (torch.Tensor): Gradient w.r.t. ``features``, shape ``[C, N, D]``.
         d_loss_d_opacities (torch.Tensor): Gradient w.r.t. ``opacities``, shape ``[C, N]``.
     """
+    _check_sparse_tile_size(tile_size)
     return _fvdb_cpp.rasterize_screen_space_gaussians_sparse_bwd(
-        _jagged_impl(pixels_to_render, "pixels_to_render"),
+        _pixels_impl(pixels_to_render),
         means2d,
         conics,
         features,
@@ -1256,19 +1307,20 @@ def rasterize_num_contributing_gaussians_sparse(
         image_height (int): Height of the render window in pixels.
         image_origin_w (int): Horizontal pixel offset of the render window.
         image_origin_h (int): Vertical pixel offset of the render window.
-        tile_size (int): Tile side length.
+        tile_size (int): Tile side length. Must be ``16``.
 
     Returns:
         num_contributing (JaggedTensor): Contributing Gaussian count per requested pixel, ``int32``.
         alphas (JaggedTensor): Accumulated alpha per requested pixel, one scalar per pixel.
     """
+    _check_sparse_tile_size(tile_size)
     result = _fvdb_cpp.rasterize_num_contributing_gaussians_sparse(
         means2d,
         conics,
         opacities,
         tile_offsets,
         tile_gaussian_ids,
-        _jagged_impl(pixels_to_render, "pixels_to_render"),
+        _pixels_impl(pixels_to_render),
         active_tiles,
         tile_pixel_mask,
         tile_pixel_cumsum,
@@ -1296,9 +1348,12 @@ def rasterize_contributing_gaussian_ids(
     num_depth_samples: int,
     num_contributing_gaussians: torch.Tensor | None = None,
 ) -> tuple[JaggedTensor, JaggedTensor]:
-    """List every Gaussian that contributes to each pixel, front to back, with its blend weight.
+    """List the Gaussians that contribute to each pixel, front to back, with their blend weights.
 
-    Passing the counts from :func:`rasterize_num_contributing_gaussians` avoids a counting pass.
+    ``num_depth_samples`` selects the mode. A positive value records at most that many of the most
+    visible contributors per pixel and ignores ``num_contributing_gaussians``. Zero or a negative
+    value records every contributor and then requires ``num_contributing_gaussians``, the counts
+    from :func:`rasterize_num_contributing_gaussians`, to size the output.
 
     Args:
         means2d (torch.Tensor): Projected 2D centers, shape ``[C, N, 2]``.
@@ -1311,9 +1366,9 @@ def rasterize_contributing_gaussian_ids(
         image_origin_w (int): Horizontal pixel offset of the render window.
         image_origin_h (int): Vertical pixel offset of the render window.
         tile_size (int): Tile side length used for ``tile_offsets``.
-        num_depth_samples (int): Upper bound on contributors recorded per pixel.
-        num_contributing_gaussians (torch.Tensor | None): Precomputed per-pixel counts, shape
-            ``[C, image_height, image_width]``, or ``None`` to count internally.
+        num_depth_samples (int): Top-K mode when positive; all-contributors mode when ``<= 0``.
+        num_contributing_gaussians (torch.Tensor | None): Per-pixel counts, shape
+            ``[C, image_height, image_width]``. Required in all-contributors mode, ignored otherwise.
 
     Returns:
         gaussian_ids (JaggedTensor): Contributing Gaussian indices per pixel, ``int32``.
@@ -1355,7 +1410,11 @@ def rasterize_contributing_gaussian_ids_sparse(
     num_depth_samples: int,
     num_contributing_gaussians: JaggedTensor | None = None,
 ) -> tuple[JaggedTensor, JaggedTensor]:
-    """List every contributing Gaussian, with its blend weight, at an arbitrary set of pixels.
+    """List contributing Gaussians, with blend weights, at an arbitrary set of pixels.
+
+    Mode selection follows :func:`rasterize_contributing_gaussian_ids`: a positive
+    ``num_depth_samples`` keeps the top-K contributors per pixel, while ``<= 0`` returns every
+    contributor and requires ``num_contributing_gaussians``.
 
     Args:
         means2d (torch.Tensor): Projected 2D centers, shape ``[C, N, 2]``.
@@ -1373,15 +1432,17 @@ def rasterize_contributing_gaussian_ids_sparse(
         image_height (int): Height of the render window in pixels.
         image_origin_w (int): Horizontal pixel offset of the render window.
         image_origin_h (int): Vertical pixel offset of the render window.
-        tile_size (int): Tile side length.
-        num_depth_samples (int): Upper bound on contributors recorded per pixel.
-        num_contributing_gaussians (JaggedTensor | None): Precomputed per-pixel counts from
-            :func:`rasterize_num_contributing_gaussians_sparse`, or ``None`` to count internally.
+        tile_size (int): Tile side length. Must be ``16``.
+        num_depth_samples (int): Top-K mode when positive; all-contributors mode when ``<= 0``.
+        num_contributing_gaussians (JaggedTensor | None): Per-pixel counts from
+            :func:`rasterize_num_contributing_gaussians_sparse`. Required in all-contributors mode,
+            ignored otherwise.
 
     Returns:
         gaussian_ids (JaggedTensor): Contributing Gaussian indices per requested pixel, ``int32``.
         weights (JaggedTensor): Blend weight of each listed Gaussian.
     """
+    _check_sparse_tile_size(tile_size)
     counts = (
         None
         if num_contributing_gaussians is None
@@ -1393,7 +1454,7 @@ def rasterize_contributing_gaussian_ids_sparse(
         opacities,
         tile_offsets,
         tile_gaussian_ids,
-        _jagged_impl(pixels_to_render, "pixels_to_render"),
+        _pixels_impl(pixels_to_render),
         active_tiles,
         tile_pixel_mask,
         tile_pixel_cumsum,
@@ -1495,7 +1556,7 @@ def rasterize_top_contributing_gaussian_ids_sparse(
         image_height (int): Height of the render window in pixels.
         image_origin_w (int): Horizontal pixel offset of the render window.
         image_origin_h (int): Vertical pixel offset of the render window.
-        tile_size (int): Tile side length.
+        tile_size (int): Tile side length. Must be ``16``.
         num_depth_samples (int): Number of contributors recorded per pixel.
 
     Returns:
@@ -1503,13 +1564,14 @@ def rasterize_top_contributing_gaussian_ids_sparse(
             ``[num_depth_samples]``, ``int32``.
         weights (JaggedTensor): Blend weight of each recorded contributor, same structure.
     """
+    _check_sparse_tile_size(tile_size)
     result = _fvdb_cpp.rasterize_top_contributing_gaussian_ids_sparse(
         means2d,
         conics,
         opacities,
         tile_offsets,
         tile_gaussian_ids,
-        _jagged_impl(pixels_to_render, "pixels_to_render"),
+        _pixels_impl(pixels_to_render),
         active_tiles,
         tile_pixel_mask,
         tile_pixel_cumsum,
