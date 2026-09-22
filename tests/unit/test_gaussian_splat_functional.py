@@ -396,7 +396,11 @@ class GaussianSplatFunctionalTests(unittest.TestCase):
 
     def test_sparse_layout_accepts_plain_tensor(self):
         px0 = self.pixels[0].jdata
-        for pixels, num_cameras in ((px0, 1), (px0.unsqueeze(0), 1), (torch.stack([px0, px0 + torch.tensor([0, 1], device=px0.device)]), 2)):
+        for pixels, num_cameras in (
+            (px0, 1),
+            (px0.unsqueeze(0), 1),
+            (torch.stack([px0, px0 + torch.tensor([0, 1], device=px0.device)]), 2),
+        ):
             active_tiles, mask, *_ = F.build_sparse_gaussian_tile_layout(
                 self.tile_size, self.tiles_w, self.tiles_h, pixels
             )
