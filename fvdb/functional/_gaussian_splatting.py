@@ -1457,6 +1457,10 @@ def rasterize_contributing_gaussian_ids_sparse(
     ``num_depth_samples`` keeps the top-K contributors per pixel, while ``<= 0`` returns every
     contributor and requires ``num_contributing_gaussians``.
 
+    The results nest cameras, then pixels, then contributors (``ldim == 2``). A selection with no
+    pixels cannot be expressed that way, so an empty layout returns ``ldim == 1`` results with one
+    empty list per camera; :func:`fvdb.jcat` will not mix the two forms.
+
     Args:
         means2d (torch.Tensor): Projected 2D centers, shape ``[C, N, 2]``.
         conics (torch.Tensor): Inverse 2D covariances, shape ``[C, N, 3]``.
