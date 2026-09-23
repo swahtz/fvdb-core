@@ -31,6 +31,7 @@ _GAUSSIAN_EXPORTS = [
     "intersect_gaussian_tiles",
     "intersect_gaussian_tiles_sparse",
     "build_sparse_gaussian_tile_layout",
+    "as_pixel_jagged",
     "rasterize_screen_space_gaussians_fwd",
     "rasterize_screen_space_gaussians_bwd",
     "rasterize_screen_space_gaussians_sparse_fwd",
@@ -94,6 +95,24 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertIs(fvdb.RollingShutterType, RollingShutterType)
         for name in ("CameraModel", "ProjectionMethod", "RollingShutterType"):
             self.assertIn(name, fvdb.__all__)
+
+    def test_as_pixel_jagged_normalizes_and_validates(self):
+        dense = torch.zeros(2, 4, 2, dtype=torch.int32)
+        pixels = F.as_pixel_jagged(dense)
+        self.assertIsInstance(pixels, JaggedTensor)
+        self.assertEqual(pixels.num_tensors, 2)
+        self.assertEqual(tuple(pixels.jdata.shape), (8, 2))
+        # A JaggedTensor is returned as is.
+        self.assertIs(F.as_pixel_jagged(pixels), pixels)
+        for bad, error in (
+            (torch.zeros(2, 4, 2), TypeError),  # float coordinates
+            (torch.zeros(0, 4, 2, dtype=torch.int64), ValueError),  # no cameras
+            (torch.zeros(2, 4, 3, dtype=torch.int64), ValueError),  # not (row, col)
+            (JaggedTensor([torch.zeros(4, 3, dtype=torch.int64)]), ValueError),
+            ([[0, 0]], TypeError),
+        ):
+            with self.assertRaises(error, msg=repr(bad)):
+                F.as_pixel_jagged(bad)
 
 
 class GaussianSplatFunctionalTests(unittest.TestCase):

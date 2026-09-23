@@ -196,6 +196,7 @@ from ._transforms import (
 
 # Gaussian splatting kernels (flat, non-differentiable wrappers)
 from ._gaussian_splatting import (
+    as_pixel_jagged,
     build_sparse_gaussian_tile_layout,
     evaluate_spherical_harmonics_bwd,
     evaluate_spherical_harmonics_fwd,
@@ -381,6 +382,7 @@ __all__ = [
     "intersect_gaussian_tiles",
     "intersect_gaussian_tiles_sparse",
     "build_sparse_gaussian_tile_layout",
+    "as_pixel_jagged",
     # Gaussian splatting: rasterization
     "rasterize_screen_space_gaussians_fwd",
     "rasterize_screen_space_gaussians_bwd",

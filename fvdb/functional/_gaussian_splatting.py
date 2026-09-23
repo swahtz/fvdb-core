@@ -62,11 +62,25 @@ def _jagged_impl(value: JaggedTensor, name: str) -> "_fvdb_cpp.JaggedTensor":
     return value._impl
 
 
-def _pixels_jagged(value: JaggedTensor | torch.Tensor) -> JaggedTensor:
-    """Normalize ``pixels_to_render`` to a JaggedTensor with one ``[P_c, 2]`` list per camera.
+def as_pixel_jagged(value: JaggedTensor | torch.Tensor) -> JaggedTensor:
+    """Normalize a ``pixels_to_render`` selection to a JaggedTensor with one ``[P_c, 2]`` list per camera.
 
+    The sparse tile-layout and rasterization wrappers call this on their input; callers that build
+    their own sparse pipeline (deduplicating pixels first, say) can call it to get the same checks.
     Only shapes and dtypes are checked here; coordinate bounds and uniqueness are checked by the
     layout kernel at the synchronization it performs anyway.
+
+    Args:
+        value (JaggedTensor | torch.Tensor): ``(row, col)`` integer pixels, either a JaggedTensor with
+            one ``[P_c, 2]`` list per camera or a dense ``[C, P, 2]`` tensor with ``C > 0``.
+
+    Returns:
+        pixels (JaggedTensor): The selection as a JaggedTensor. A JaggedTensor input is returned as is.
+
+    Raises:
+        TypeError: If ``value`` is neither a JaggedTensor nor a Tensor, or its coordinates are not
+            ``int32`` or ``int64``.
+        ValueError: If the shape is not ``[C, P, 2]`` (tensor) or ``[P, 2]`` per list (JaggedTensor).
     """
     if isinstance(value, torch.Tensor):
         if value.dim() != 3 or value.shape[0] == 0 or value.shape[2] != 2:
@@ -106,7 +120,7 @@ def _sparse_prologue(
     than silently returning zeros.
     """
     _check_sparse_tile_size(tile_size)
-    pixels = _pixels_jagged(pixels_to_render)
+    pixels = as_pixel_jagged(pixels_to_render)
     empty = active_tiles.numel() == 0
     if empty and (pixels.jdata.shape[0] != 0 or pixel_map.numel() != 0):
         raise ValueError(
@@ -762,7 +776,7 @@ def build_sparse_gaussian_tile_layout(
     _check_sparse_tile_size(tile_size)
     if num_tiles_h <= 0 or num_tiles_w <= 0:
         raise ValueError(f"num_tiles_h and num_tiles_w must be positive, got {num_tiles_h} and {num_tiles_w}")
-    pixels = _pixels_jagged(pixels_to_render)
+    pixels = as_pixel_jagged(pixels_to_render)
     return _fvdb_cpp.build_sparse_gaussian_tile_layout(tile_size, num_tiles_w, num_tiles_h, pixels._impl)
 
 

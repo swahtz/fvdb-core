@@ -270,6 +270,7 @@ Tile Intersection
 .. autofunction:: intersect_gaussian_tiles
 .. autofunction:: intersect_gaussian_tiles_sparse
 .. autofunction:: build_sparse_gaussian_tile_layout
+.. autofunction:: as_pixel_jagged
 
 Rasterization
 ~~~~~~~~~~~~~
