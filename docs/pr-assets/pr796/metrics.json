@@ -1,0 +1,70 @@
+{
+  "pr_head": "7ff0fd6089790a6de4460b61ffd749bf9eedffc0",
+  "legacy_commit": "3c9e2727678faafa88a0e9589de831c290c37133",
+  "settings": {
+    "band": 3,
+    "order": 3,
+    "smooth": 0
+  },
+  "device": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+  "rod": [
+    {
+      "iterations": 3,
+      "fixed_reference_max_error_vox": 4.440892098500626e-16,
+      "legacy_inside_samples": 4,
+      "fixed_inside_samples": 4
+    },
+    {
+      "iterations": 6,
+      "fixed_reference_max_error_vox": 8.881784197001252e-16,
+      "legacy_inside_samples": 4,
+      "fixed_inside_samples": 4
+    },
+    {
+      "iterations": 12,
+      "fixed_reference_max_error_vox": 8.881784197001252e-16,
+      "legacy_inside_samples": 0,
+      "fixed_inside_samples": 4
+    },
+    {
+      "iterations": 48,
+      "fixed_reference_max_error_vox": 8.881784197001252e-16,
+      "legacy_inside_samples": 0,
+      "fixed_inside_samples": 4
+    }
+  ],
+  "chair": {
+    "input": "chair3_res64_iter1000_band3_passes3.nvdb",
+    "num_voxels": 52298,
+    "voxel_size": 0.015625,
+    "sweep": [
+      {
+        "iterations": 3,
+        "legacy_sign_flips": 3,
+        "fixed_sign_flips": 0,
+        "fixed_reference_max_error_vox": 7.152557373046875e-07
+      },
+      {
+        "iterations": 12,
+        "legacy_sign_flips": 812,
+        "fixed_sign_flips": 0,
+        "fixed_reference_max_error_vox": 9.5367431640625e-07
+      },
+      {
+        "iterations": 24,
+        "legacy_sign_flips": 1402,
+        "fixed_sign_flips": 0,
+        "fixed_reference_max_error_vox": 9.5367431640625e-07
+      },
+      {
+        "iterations": 48,
+        "legacy_sign_flips": 1985,
+        "fixed_sign_flips": 0,
+        "fixed_reference_max_error_vox": 1.6689300537109375e-06,
+        "Input SDF_silhouette_changed_pixels": 0,
+        "Before subcell fix_silhouette_changed_pixels": 18347,
+        "PR #796_silhouette_changed_pixels": 0
+      }
+    ]
+  }
+}
