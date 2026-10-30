@@ -8,21 +8,41 @@
 
 namespace fvdb {
 
-std::shared_ptr<detail::VbmCache>
-GridBatchData::makeVbmCache() {
-    return std::make_shared<detail::VbmCache>();
+detail::VbmCache &
+GridBatchData::vbmCache() const {
+    std::lock_guard<std::mutex> lock(mVbmMutex);
+    if (!mVbmCache) {
+        mVbmCache = std::make_shared<detail::VbmCache>();
+    }
+    return *mVbmCache;
 }
 
 const detail::BatchVbm &
 GridBatchData::vbm() const {
-    return mVbmCache->acquire(*this);
+    return vbmCache().acquire(*this);
 }
 
 detail::GridVbm
 GridBatchData::vbmAt(int64_t bi) const {
-    bi = negativeToPositiveIndexWithRangecheck(bi);
-    mVbmCache->acquire(*this);
-    return mVbmCache->gridVbm(bi);
+    bi                      = negativeToPositiveIndexWithRangecheck(bi);
+    detail::VbmCache &cache = vbmCache();
+    cache.acquire(*this);
+    return cache.gridVbm(bi);
+}
+
+const detail::BatchVbm *
+GridBatchData::vbmOnReuse() const {
+    {
+        std::lock_guard<std::mutex> lock(mVbmMutex);
+        if (!mVbmCache) {
+            if (!mVbmUsedOnce) {
+                mVbmUsedOnce = true;
+                return nullptr;
+            }
+            mVbmCache = std::make_shared<detail::VbmCache>();
+        }
+    }
+    return mVbmCache->tryAcquire(*this);
 }
 
 // -----------------------------------------------------------------------

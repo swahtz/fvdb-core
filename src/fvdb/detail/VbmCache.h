@@ -96,10 +96,15 @@ class VbmCache {
     /// must pass the same GridBatchData; GridBatchData::vbm() is the usual entry point.
     const BatchVbm &acquire(const GridBatchData &owner);
 
+    /// @brief Like acquire(), but returns nullptr instead of throwing when the VBMs are not built
+    /// yet and the current stream is capturing a CUDA graph.
+    const BatchVbm *tryAcquire(const GridBatchData &owner);
+
     /// @brief One grid's slice of a built BatchVbm, or a zero GridVbm for an empty grid.
     GridVbm gridVbm(int64_t bi) const;
 
   private:
+    const BatchVbm *acquireOrNull(const GridBatchData &owner, bool throwDuringCapture);
     void build(const GridBatchData &owner, const c10::cuda::CUDAStream &stream);
 
     std::mutex mMutex;

@@ -25,6 +25,16 @@ VbmCache::~VbmCache() {
 
 const BatchVbm &
 VbmCache::acquire(const GridBatchData &owner) {
+    return *acquireOrNull(owner, /*throwDuringCapture=*/true);
+}
+
+const BatchVbm *
+VbmCache::tryAcquire(const GridBatchData &owner) {
+    return acquireOrNull(owner, /*throwDuringCapture=*/false);
+}
+
+const BatchVbm *
+VbmCache::acquireOrNull(const GridBatchData &owner, bool throwDuringCapture) {
     TORCH_CHECK(owner.device().is_cuda(), "VbmCache is only supported for CUDA grids");
     c10::cuda::CUDAGuard guard(owner.device());
     std::lock_guard<std::mutex> lock(mMutex);
@@ -37,11 +47,14 @@ VbmCache::acquire(const GridBatchData &owner) {
     if (!mOwner) {
         // A build captured into a graph would run only on replay, while the cache would already
         // count as built for eager use
-        TORCH_CHECK(!capturing,
-                    "The grid's VoxelBlockManagers are built on first use, which cannot happen "
-                    "during CUDA graph capture. Run the op once before capturing.");
+        if (capturing) {
+            TORCH_CHECK(!throwDuringCapture,
+                        "The grid's VoxelBlockManagers are built on first use, which cannot happen "
+                        "during CUDA graph capture. Run the op once before capturing.");
+            return nullptr;
+        }
         build(owner, stream);
-        return mVbm;
+        return &mVbm;
     }
     TORCH_CHECK(mOwner == &owner, "VbmCache::acquire called with a batch that does not own it");
 
@@ -53,7 +66,7 @@ VbmCache::acquire(const GridBatchData &owner) {
             // A capture can only wait on an event recorded outside it as an external event node.
             // The wait orders replays, not later eager work, so the stream is not marked synced.
             C10_CUDA_CHECK(cudaStreamWaitEvent(stream, mBuiltOn, cudaEventWaitExternal));
-            return mVbm;
+            return &mVbm;
         }
         // Execution ordering: this consumer stream must see the finished build.
         C10_CUDA_CHECK(cudaStreamWaitEvent(stream, mBuiltOn, 0));
@@ -62,7 +75,7 @@ VbmCache::acquire(const GridBatchData &owner) {
         mBuffer.record_stream(stream.unwrap());
         mSyncedStreams.push_back(stream);
     }
-    return mVbm;
+    return &mVbm;
 }
 
 void

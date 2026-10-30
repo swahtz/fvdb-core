@@ -413,3 +413,19 @@ TEST(VbmCacheTest, NegativeGridIndex) {
     EXPECT_EQ(negative.blockCount, last.blockCount);
     EXPECT_ANY_THROW(batch->vbmAt(2));
 }
+
+TEST(VbmCacheTest, VbmOnReuseSkipsFirstCall) {
+    if (!cudaIsAvailable()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+    auto batch = makeBatch({randomIjk(100, 16, 32)}, torch::Device(torch::kCUDA, 0));
+    EXPECT_EQ(batch->vbmOnReuse(), nullptr);
+    const BatchVbm *reused = batch->vbmOnReuse();
+    ASSERT_NE(reused, nullptr);
+    EXPECT_EQ(reused, &batch->vbm());
+
+    // A batch whose VBMs are already built returns them on its first call
+    auto built          = makeBatch({randomIjk(100, 16, 33)}, torch::Device(torch::kCUDA, 0));
+    const BatchVbm &vbm = built->vbm();
+    EXPECT_EQ(built->vbmOnReuse(), &vbm);
+}

@@ -1,11 +1,11 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 #
-# Parity tests for the VBM-backed CUDA per-active-voxel iteration path used by
-# Grid.ijk / GridBatch.ijk (ActiveGridCoords) and morton/hilbert (SerializeEncode):
-# the CUDA results must match the CPU leaf-scan path bitwise, including through
-# sliced GridBatch views (which build their own VBMs) and for batches containing
-# empty grids.
+# Parity tests for the CUDA per-active-voxel iteration used by Grid.ijk / GridBatch.ijk
+# (ActiveGridCoords) and morton/hilbert (SerializeEncode). A batch's first call takes the leaf
+# scan and later calls take the VBM path, so each test checks both against the CPU leaf scan
+# bitwise, including through sliced GridBatch views (which build their own VBMs) and for
+# batches containing empty grids.
 import unittest
 
 import torch
@@ -17,6 +17,11 @@ def _random_ijk(num: int, box: int, seed: int) -> torch.Tensor:
     gen = torch.Generator().manual_seed(seed)
     perm = torch.randperm(box * box * box, generator=gen)[:num]
     return torch.stack([perm // (box * box), (perm // box) % box, perm % box], dim=1).to(torch.int32)
+
+
+def _first_and_reused(op):
+    # The first call takes the leaf scan; the second builds and uses the VBMs
+    return [op().jdata.cpu() for _ in range(2)]
 
 
 class ActiveGridCoordsVbmTests(unittest.TestCase):
@@ -33,21 +38,25 @@ class ActiveGridCoordsVbmTests(unittest.TestCase):
     def test_ijk_matches_cpu(self):
         ijks = [_random_ijk(100, 16, 1), _random_ijk(512, 32, 2), _random_ijk(513, 32, 3), _random_ijk(9000, 48, 4)]
         cpu, cuda = self._make_batches(ijks)
-        self.assertTrue(torch.equal(cuda.ijk.jdata.cpu(), cpu.ijk.jdata))
+        for out in _first_and_reused(lambda: cuda.ijk):
+            self.assertTrue(torch.equal(out, cpu.ijk.jdata))
 
     def test_ijk_on_sliced_batch(self):
         ijks = [_random_ijk(600, 16, 5), _random_ijk(700, 16, 6), _random_ijk(800, 16, 7)]
         cpu, cuda = self._make_batches(ijks)
         # The parent's VBMs are built first; the view builds its own.
-        _ = cuda.ijk
-        self.assertTrue(torch.equal(cuda[1:3].ijk.jdata.cpu(), cpu[1:3].ijk.jdata))
-        self.assertTrue(torch.equal(cuda[1:3].ijk.jdata.cpu(), cpu.ijk[1:3].jdata))
+        _first_and_reused(lambda: cuda.ijk)
+        view = cuda[1:3]
+        for out in _first_and_reused(lambda: view.ijk):
+            self.assertTrue(torch.equal(out, cpu[1:3].ijk.jdata))
+            self.assertTrue(torch.equal(out, cpu.ijk[1:3].jdata))
 
     def test_ijk_with_empty_grid(self):
         ijks = [torch.empty(0, 3, dtype=torch.int32), _random_ijk(100, 16, 8)]
         cpu, cuda = self._make_batches(ijks)
         self.assertEqual(cuda.ijk[0].jdata.shape[0], 0)
-        self.assertTrue(torch.equal(cuda.ijk.jdata.cpu(), cpu.ijk.jdata))
+        for out in _first_and_reused(lambda: cuda.ijk):
+            self.assertTrue(torch.equal(out, cpu.ijk.jdata))
 
     def test_ijk_large_batch_with_empty_grids(self):
         # Empty grids at the start, middle and end own no VBM blocks in the batched build and launch.
@@ -55,28 +64,33 @@ class ActiveGridCoordsVbmTests(unittest.TestCase):
         ijks = [empty] + [_random_ijk(50 + 97 * k, 24, 20 + k) for k in range(12)] + [empty, empty]
         ijks.insert(6, empty)
         cpu, cuda = self._make_batches(ijks)
-        self.assertTrue(torch.equal(cuda.ijk.jdata.cpu(), cpu.ijk.jdata))
-        self.assertTrue(torch.equal(cuda[3:11].ijk.jdata.cpu(), cpu[3:11].ijk.jdata))
+        for out in _first_and_reused(lambda: cuda.ijk):
+            self.assertTrue(torch.equal(out, cpu.ijk.jdata))
+        view = cuda[3:11]
+        for out in _first_and_reused(lambda: view.ijk):
+            self.assertTrue(torch.equal(out, cpu[3:11].ijk.jdata))
 
     def test_ijk_inside_cuda_graph_capture(self):
-        # The VBM build cannot be captured, so the first use must come before capture
-        _, cuda = self._make_batches([_random_ijk(600, 16, 40), _random_ijk(700, 16, 41)])
-        with self.assertRaisesRegex(RuntimeError, "Run the op once before capturing"):
-            with torch.cuda.graph(torch.cuda.CUDAGraph()):
+        # The VBM build cannot be captured, so an unbuilt batch takes the leaf scan in capture
+        ijks = [_random_ijk(600, 16, 40), _random_ijk(700, 16, 41)]
+        cpu, _ = self._make_batches(ijks)
+        expected = cpu.ijk.jdata.cuda()
+        for eager_calls in (0, 1, 2):
+            _, cuda = self._make_batches(ijks)
+            for _ in range(eager_calls):
                 cuda.ijk
-
-        expected = cuda.ijk.jdata.clone()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            out = cuda.ijk.jdata
-        graph.replay()
-        torch.cuda.synchronize()
-        self.assertTrue(torch.equal(out, expected))
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out = cuda.ijk.jdata
+            graph.replay()
+            torch.cuda.synchronize()
+            self.assertTrue(torch.equal(out, expected), f"after {eager_calls} eager calls")
 
     def test_morton_matches_cpu(self):
         ijks = [_random_ijk(1000, 24, 9), _random_ijk(1500, 24, 10)]
         cpu, cuda = self._make_batches(ijks)
-        self.assertTrue(torch.equal(cuda.morton().jdata.cpu(), cpu.morton().jdata))
+        for out in _first_and_reused(cuda.morton):
+            self.assertTrue(torch.equal(out, cpu.morton().jdata))
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@
 #include <torch/types.h>
 
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -108,10 +109,14 @@ struct GridBatchData : public torch::CustomClassHolder {
     // Lazily-built VoxelBlockManagers for this batch's grids (pure derived state; never
     // serialized). Every GridBatchData, views included, owns its own: the VBMs are built per
     // batch, and topology is immutable after construction, so they never need invalidation.
-    std::shared_ptr<detail::VbmCache> mVbmCache;
+    // The cache is created on first VBM use, so batches that never use one allocate nothing.
+    // mVbmMutex guards creating the cache and mVbmUsedOnce.
+    mutable std::mutex mVbmMutex;
+    mutable bool mVbmUsedOnce = false;
+    mutable std::shared_ptr<detail::VbmCache> mVbmCache;
 
     // Defined in GridBatchData.cu, where detail::VbmCache is complete.
-    static std::shared_ptr<detail::VbmCache> makeVbmCache();
+    detail::VbmCache &vbmCache() const;
 
   public:
     // -----------------------------------------------------------------------
@@ -131,8 +136,7 @@ struct GridBatchData : public torch::CustomClassHolder {
         : mHostGridMetadata(hostGridMetadata), mDeviceGridMetadata(deviceGridMetadata),
           mBatchSize(batchSize), mBatchMetadata(std::move(batchMetadata)),
           mLeafBatchIndices(std::move(leafBatchIndices)), mBatchOffsets(std::move(batchOffsets)),
-          mListIndices(std::move(listIndices)), mStorage(std::move(storage)),
-          mVbmCache(makeVbmCache()) {}
+          mListIndices(std::move(listIndices)), mStorage(std::move(storage)) {}
 
     GridBatchData(const GridBatchData &sharingStorageOf,
                   GridMetadata *hostGridMetadata,
@@ -395,6 +399,11 @@ struct GridBatchData : public torch::CustomClassHolder {
     // bi's slice. Defined in GridBatchData.cu (requires the complete detail types).
     const detail::BatchVbm &vbm() const;
     detail::GridVbm vbmAt(int64_t bi) const;
+
+    // The VBMs for ops that can also run on the leaf scan. Returns nullptr on the batch's first
+    // call, so one-shot use skips the build, and during CUDA graph capture before the VBMs are
+    // built. Otherwise builds them if needed and returns them like vbm().
+    const detail::BatchVbm *vbmOnReuse() const;
 
     const VoxelCoordTransform &
     primalTransformAt(int64_t bi) const {

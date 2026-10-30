@@ -219,10 +219,15 @@ struct BasePerActiveVoxelProcessor {
             makeOutTensorFromGridBatch<DeviceTag, OutElementType>(grid_batch, out_element);
         auto out_accessor = makeAccessor<DeviceTag, OutElementType>(out_tensor);
         if constexpr (DeviceTag == torch::kCUDA) {
-            // VBM-backed iteration: one thread per active voxel via the cached per-grid
-            // VoxelBlockManager decode, instead of one thread per 512-slot leaf position.
-            forEachActiveVoxelVbmCUDA(
-                grid_batch, *static_cast<Derived const *>(this), out_accessor);
+            // A reused batch iterates one thread per active voxel through its VoxelBlockManagers.
+            // The first call takes the leaf scan, so one-shot use never pays the VBM build.
+            if (const detail::BatchVbm *vbm = grid_batch.vbmOnReuse()) {
+                forEachActiveVoxelInVbmCUDA(
+                    grid_batch, *vbm, *static_cast<Derived const *>(this), out_accessor);
+            } else {
+                forEachVoxelCUDA<1024>(
+                    1, grid_batch, *static_cast<Derived const *>(this), out_accessor);
+            }
         } else if constexpr (DeviceTag == torch::kPrivateUse1) {
             forEachVoxelPrivateUse1(
                 1, grid_batch, *static_cast<Derived const *>(this), out_accessor);

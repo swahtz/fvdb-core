@@ -96,17 +96,20 @@ forEachActiveVoxelVbmKernel(const detail::BatchVbm vbm,
 ///     void perActiveVoxel(nanovdb::Coord const &ijk, int64_t featureIdx, Args...) const
 /// where featureIdx is the batch-wide linear voxel index (cumVoxelsAt(bi) + in-grid index).
 ///
-/// One kernel launch per batch; the first call on a batch also builds its VBMs. CUDA-only;
-/// callers must fall back to the leaf-scan paths for CPU and PrivateUse1 grids.
+/// One kernel launch per batch, iterating @p vbm, which must be batchHdl's VBMs acquired on the
+/// current stream. CUDA-only; callers must fall back to the leaf-scan paths for CPU and
+/// PrivateUse1 grids.
 template <typename Func, typename... Args>
 void
-forEachActiveVoxelVbmCUDA(const fvdb::GridBatchData &batchHdl, Func func, Args... args) {
+forEachActiveVoxelInVbmCUDA(const fvdb::GridBatchData &batchHdl,
+                            const detail::BatchVbm &vbm,
+                            Func func,
+                            Args... args) {
     TORCH_CHECK(batchHdl.device().is_cuda(), "Grid batch must be on a CUDA device");
     TORCH_CHECK(batchHdl.device().has_index(), "Grid batch device must have an index");
     c10::cuda::CUDAGuard deviceGuard(batchHdl.device());
     const auto stream = at::cuda::getCurrentCUDAStream(batchHdl.device().index());
 
-    const detail::BatchVbm &vbm = batchHdl.vbm();
     if (vbm.blockCount == 0) {
         return;
     }
@@ -117,6 +120,15 @@ forEachActiveVoxelVbmCUDA(const fvdb::GridBatchData &batchHdl, Func func, Args..
     _private::forEachActiveVoxelVbmKernel<<<numBlocks, _private::kVbmForEachBlockDim, 0, stream>>>(
         vbm, detail::BatchVbmLayout::of(batchHdl), func, args...);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+/// As forEachActiveVoxelInVbmCUDA, acquiring the batch's VBMs first. The first call on a batch
+/// also builds them.
+template <typename Func, typename... Args>
+void
+forEachActiveVoxelVbmCUDA(const fvdb::GridBatchData &batchHdl, Func func, Args... args) {
+    c10::cuda::CUDAGuard deviceGuard(batchHdl.device());
+    forEachActiveVoxelInVbmCUDA(batchHdl, batchHdl.vbm(), func, args...);
 }
 
 } // namespace fvdb
